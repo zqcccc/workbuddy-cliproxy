@@ -12,36 +12,71 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
-// realResourcePayload is a verbatim (trimmed) /v2/billing/meter/get-user-resource
-// response. Note CycleCapacityRemainPrecise arriving as a *string* while
-// CycleCapacitySizePrecise arrives as a number: the endpoint mixes both.
-const realResourcePayload = `{
+// realSummaryPayload is a verbatim (trimmed) api1 response. Note
+// CycleRemainCapacity arriving as a *string* for one package and as a number
+// for the other: the endpoint mixes both.
+const realSummaryPayload = `{
   "code": 0,
   "msg": "OK",
   "data": {
-    "Response": {
-      "Data": {
-        "TotalCount": 2,
-        "TotalDosage": 1640,
-        "Accounts": [
+    "Packages": [
+      {
+        "PackageCode": "TCACA_code_008_cfWoLwvjU4",
+        "CycleTotalCapacity": "500",
+        "CycleRemainCapacity": "500",
+        "CycleUsedCapacity": "0",
+        "CapacityUnit": "credits"
+      },
+      {
+        "PackageCode": "TCACA_code_007_nzdH5h4Nl0",
+        "CycleTotalCapacity": 1500,
+        "CycleRemainCapacity": 840.36000015,
+        "CycleUsedCapacity": "659.63999985",
+        "CapacityUnit": "credits"
+      },
+      {
+        "PackageCode": "TCACA_code_002_AkiJS3ZHF5",
+        "CycleTotalCapacity": 200,
+        "CycleRemainCapacity": 50,
+        "CycleUsedCapacity": "150",
+        "CapacityUnit": "credits"
+      }
+    ],
+    "SubscriptionPackageCode": "",
+    "IsPaidUser": false,
+    "IsProtectedPriceUser": false
+  }
+}`
+
+// realFreePayload is the matching api3 response. Only the refilling package
+// carries a slice; the bonus one carries none, which is what a real CN
+// account looks like today.
+const realFreePayload = `{
+  "code": 0,
+  "msg": "OK",
+  "data": {
+    "TotalCount": 2,
+    "Accounts": [
+      {
+        "PackageName": "CodeBuddy个人体验版",
+        "PackageCode": "TCACA_code_008_cfWoLwvjU4",
+        "CapacityType": 4,
+        "CycleEndTime": "2026-09-30 23:59:59",
+        "SlicePeriodUsageDetails": [
           {
-            "PackageName": "CodeBuddy个人体验版",
-            "PackageCode": "TCACA_code_008_cfWoLwvjU4",
-            "CycleCapacitySizePrecise": "500",
-            "CycleCapacityRemainPrecise": "500",
-            "CycleEndTime": "2026-09-30 23:59:59",
-            "DeductionEndTime": "2047-09-09 09:00:00"
-          },
-          {
-            "PackageName": "CodeBuddy个人版国内运营裂变包",
-            "PackageCode": "TCACA_code_007_nzdH5h4Nl0",
-            "CycleCapacitySizePrecise": 1500,
-            "CycleCapacityRemainPrecise": 840.36000015,
-            "CycleEndTime": "2026-09-16 22:26:56"
+            "SlicePeriodCapacitySizePrecise": "500",
+            "SlicePeriodCapacityRemainPrecise": "120"
           }
         ]
+      },
+      {
+        "PackageName": "CodeBuddy个人版国内运营裂变包",
+        "PackageCode": "TCACA_code_007_nzdH5h4Nl0",
+        "CapacityType": 1,
+        "CycleEndTime": "2026-09-16 22:26:56",
+        "SlicePeriodUsageDetails": null
       }
-    }
+    ]
   }
 }`
 
@@ -60,28 +95,32 @@ func testStoredAuth() *storedAuth {
 	}
 }
 
-// newQuotaServer answers both billing paths and records the last request so a
-// test can assert the mandatory UA header and the POST body.
-func newQuotaServer(t *testing.T, resourceStatus int) (*httptest.Server, *http.Request, *[]byte) {
+// recordedCall is one request the fake upstream saw.
+type recordedCall struct {
+	method string
+	header http.Header
+	body   []byte
+}
+
+// newQuotaServer answers the three billing paths and records what was asked,
+// so a test can assert the mandatory UA header, the POST method and the body.
+func newQuotaServer(t *testing.T, summaryStatus int) (*httptest.Server, map[string]recordedCall) {
 	t.Helper()
-	var lastReq http.Request
-	var lastBody []byte
+	calls := map[string]recordedCall{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Only the resource call is recorded: the plan-type call that follows
-		// would otherwise overwrite it with an empty body.
-		if r.URL.Path == pathUserResource {
-			lastReq = *r
-			lastBody, _ = io.ReadAll(r.Body)
-		}
+		body, _ := io.ReadAll(r.Body)
+		calls[r.URL.Path] = recordedCall{method: r.Method, header: r.Header.Clone(), body: body}
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
-		case pathUserResource:
-			if resourceStatus != http.StatusOK {
-				w.WriteHeader(resourceStatus)
+		case pathResourceSummary:
+			if summaryStatus != http.StatusOK {
+				w.WriteHeader(summaryStatus)
 				_, _ = w.Write([]byte(`{"code":10085,"msg":"请求不合法"}`))
 				return
 			}
-			_, _ = w.Write([]byte(realResourcePayload))
+			_, _ = w.Write([]byte(realSummaryPayload))
+		case pathFreePackages:
+			_, _ = w.Write([]byte(realFreePayload))
 		case pathPaymentType:
 			_, _ = w.Write([]byte(`{"code":0,"msg":"OK","data":{"paymentType":"free"}}`))
 		default:
@@ -89,30 +128,56 @@ func newQuotaServer(t *testing.T, resourceStatus int) (*httptest.Server, *http.R
 		}
 	}))
 	t.Cleanup(srv.Close)
-	return srv, &lastReq, &lastBody
+	return srv, calls
 }
 
 func TestFetchQuotaParsesPackages(t *testing.T) {
-	srv, lastReq, lastBody := newQuotaServer(t, http.StatusOK)
+	srv, calls := newQuotaServer(t, http.StatusOK)
 	got := fetchQuotaFrom(srv.URL, testStoredAuth())
 	if got.Error != "" {
 		t.Fatalf("unexpected error: %s", got.Error)
 	}
-	if got.Left != 1640 {
-		t.Errorf("left = %v, want 1640", got.Left)
+	// The balance is the sum of the packages; api1 has no total field.
+	if got.Left < 1390.3 || got.Left > 1390.4 {
+		t.Errorf("left = %v, want ~1390.36", got.Left)
 	}
-	if len(got.Packages) != 2 {
-		t.Fatalf("packages = %d, want 2", len(got.Packages))
+	if len(got.Packages) != 3 {
+		t.Fatalf("packages = %d, want 3", len(got.Packages))
 	}
-	// Packages come back sorted by remaining credits, largest first.
-	if got.Packages[0].Left < 840.3 || got.Packages[0].Left > 840.4 || got.Packages[0].Total != 1500 {
-		t.Errorf("first package = %v/%v, want ~840.36/1500", got.Packages[0].Left, got.Packages[0].Total)
+	// The package that refills leads: it is the one an operator watches.
+	first := got.Packages[0]
+	if !first.Free || first.Code != "TCACA_code_008_cfWoLwvjU4" {
+		t.Fatalf("first package = %+v, want the free 008 package", first)
 	}
-	if got.Packages[1].Left != 500 || got.Packages[1].Total != 500 {
-		t.Errorf("second package = %v/%v, want 500/500", got.Packages[1].Left, got.Packages[1].Total)
+	if first.Left != 500 || first.Total != 500 {
+		t.Errorf("free package = %v/%v, want 500/500", first.Left, first.Total)
 	}
-	if got.Packages[1].CycleEnd != "2026-09-30 23:59:59" {
-		t.Errorf("cycle end = %q", got.Packages[1].CycleEnd)
+	if first.CycleEnd != "2026-09-30 23:59:59" {
+		t.Errorf("cycle end = %q", first.CycleEnd)
+	}
+	// The refilling package carries the current slice; the other does not.
+	if !first.HasSlice || first.SliceLeft != 120 || first.SliceTotal != 500 {
+		t.Errorf("slice = %v %v/%v, want 120/500", first.HasSlice, first.SliceLeft, first.SliceTotal)
+	}
+	// 运营裂变包 is a free code in the client's list but does not refill.
+	second := got.Packages[1]
+	if !second.Free || second.Code != "TCACA_code_007_nzdH5h4Nl0" {
+		t.Fatalf("second package = %+v, want the free 007 package", second)
+	}
+	if second.HasSlice {
+		t.Errorf("bonus package has a slice it should not: %+v", second)
+	}
+	if second.Name != "CodeBuddy个人版国内运营裂变包" {
+		t.Errorf("name = %q, want the upstream one", second.Name)
+	}
+	// The purchase sorts last and falls back to the local name map, since
+	// api3 only knows about free codes.
+	third := got.Packages[2]
+	if third.Free {
+		t.Errorf("paid package marked free: %+v", third)
+	}
+	if third.Name != "Pro 月包" {
+		t.Errorf("paid package name = %q, want Pro 月包", third.Name)
 	}
 	if got.Plan != "free" {
 		t.Errorf("plan = %q, want free", got.Plan)
@@ -120,20 +185,99 @@ func TestFetchQuotaParsesPackages(t *testing.T) {
 	if got.Label != "知了十八" || got.Region != regionCN {
 		t.Errorf("label/region = %q/%q", got.Label, got.Region)
 	}
-	// The gateway rejects the call without a CLI User-Agent and without a body.
-	if ua := lastReq.Header.Get("User-Agent"); !strings.Contains(ua, "CodeBuddy/") {
+	// The gateway rejects the call without a CLI User-Agent.
+	call := calls[pathResourceSummary]
+	if ua := call.header.Get("User-Agent"); !strings.Contains(ua, "CodeBuddy/") {
 		t.Errorf("User-Agent = %q", ua)
 	}
-	if lastReq.Method != http.MethodPost {
-		t.Errorf("method = %s, want POST (the route is method-specific)", lastReq.Method)
+	if call.method != http.MethodPost {
+		t.Errorf("method = %s, want POST (the route is method-specific)", call.method)
 	}
-	if !strings.Contains(string(*lastBody), quotaProductCode) {
-		t.Errorf("body = %s, want ProductCode", *lastBody)
+	// api1 takes no business parameters, so an empty object is a valid body.
+	if body := strings.TrimSpace(string(call.body)); body != "{}" {
+		t.Errorf("summary body = %s, want {}", body)
+	}
+	// api3 is what makes the slice show up, and it must send PackageCodes or
+	// upstream answers 400 / 10001.
+	free := calls[pathFreePackages]
+	if !strings.Contains(string(free.body), "PackageCodes") {
+		t.Errorf("free body = %s, want PackageCodes", free.body)
+	}
+	if !strings.Contains(string(free.body), "SlicePeriodStartTime") {
+		t.Errorf("free body = %s, want the slice range", free.body)
+	}
+}
+
+// TestFetchQuotaWithoutSlice covers the account shape seen in production: api3
+// returns the packages but no SlicePeriodUsageDetails, and the balance must
+// still come through from the cycle figures instead of collapsing to zero.
+func TestFetchQuotaWithoutSlice(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case pathResourceSummary:
+			_, _ = w.Write([]byte(`{"code":0,"data":{"Packages":[
+			 {"PackageCode":"TCACA_code_035_ArVxJcGDsm","CycleTotalCapacity":"100",
+			  "CycleRemainCapacity":"22.71000001"}],"IsPaidUser":false}}`))
+		case pathFreePackages:
+			_, _ = w.Write([]byte(`{"code":0,"data":{"Accounts":[
+			 {"PackageCode":"TCACA_code_035_ArVxJcGDsm","PackageName":"Free Plan Subscription",
+			  "CapacityType":4,"CycleEndTime":"2026-09-30 23:59:59","SlicePeriodUsageDetails":null}]}}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	got := fetchQuotaFrom(srv.URL, testStoredAuth())
+	if got.Error != "" {
+		t.Fatalf("unexpected error: %s", got.Error)
+	}
+	if got.Left < 22.7 || got.Left > 22.8 {
+		t.Errorf("left = %v, want ~22.71", got.Left)
+	}
+	if len(got.Packages) != 1 {
+		t.Fatalf("packages = %d, want 1", len(got.Packages))
+	}
+	if got.Packages[0].HasSlice {
+		t.Errorf("slice = %v/%v, want none", got.Packages[0].SliceLeft, got.Packages[0].SliceTotal)
+	}
+	if got.Packages[0].Total != 100 {
+		t.Errorf("total = %v, want 100", got.Packages[0].Total)
+	}
+}
+
+// TestFetchQuotaSurvivesFreePackageFailure checks that api3 is best-effort: it
+// only enriches api1, so a failure must not hide the balance.
+func TestFetchQuotaSurvivesFreePackageFailure(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == pathResourceSummary {
+			_, _ = w.Write([]byte(`{"code":0,"data":{"Packages":[
+			 {"PackageCode":"TCACA_code_008_cfWoLwvjU4","CycleTotalCapacity":"500",
+			  "CycleRemainCapacity":"500"}],"IsPaidUser":false}}`))
+			return
+		}
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer srv.Close()
+
+	got := fetchQuotaFrom(srv.URL, testStoredAuth())
+	if got.Error != "" {
+		t.Fatalf("unexpected error: %s", got.Error)
+	}
+	if got.Left != 500 {
+		t.Errorf("left = %v, want 500", got.Left)
+	}
+	// No upstream name means the local code map has to supply one rather than
+	// showing a raw TCACA_code_... string.
+	if got.Packages[0].Name != packageDisplayNames["TCACA_code_008_cfWoLwvjU4"] {
+		t.Errorf("name = %q, want the mapped name", got.Packages[0].Name)
 	}
 }
 
 func TestFetchQuotaExpiredToken(t *testing.T) {
-	srv, _, _ := newQuotaServer(t, http.StatusUnauthorized)
+	srv, _ := newQuotaServer(t, http.StatusUnauthorized)
 	got := fetchQuotaFrom(srv.URL, testStoredAuth())
 	if got.Error == "" {
 		t.Fatal("expected an error for an expired token")
@@ -147,22 +291,27 @@ func TestFetchQuotaExpiredToken(t *testing.T) {
 	}
 }
 
-// TestFetchQuotaToleratesMixedTimestampTypes covers a real response shape:
-// DeductionEndTime arriving as a millisecond epoch while CycleEndTime stays a
-// formatted string. Decoding it into a string field failed the whole account.
+// TestFetchQuotaToleratesMixedTimestampTypes covers a real response shape the
+// billing API still produces: CycleEndTime arriving as a millisecond epoch for
+// one package and as a formatted string for another. Decoding that into a
+// string field failed the whole account.
 func TestFetchQuotaToleratesMixedTimestampTypes(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		if r.URL.Path == pathUserResource {
-			_, _ = w.Write([]byte(`{"code":0,"msg":"OK","data":{"Response":{"Data":{"TotalDosage":"500","Accounts":[
-			 {"PackageName":"p","PackageCode":"c","CycleCapacitySizePrecise":500,
-			  "CycleCapacityRemainPrecise":"40","CycleEndTime":"2026-09-30 23:59:59",
-			  "DeductionEndTime":2047300014000},
-			 {"PackageName":"q","CycleCapacitySizePrecise":100,
-			  "CycleCapacityRemainPrecise":100,"DeductionEndTime":1791680409000}]}}}}`))
-			return
+		switch r.URL.Path {
+		case pathResourceSummary:
+			_, _ = w.Write([]byte(`{"code":0,"msg":"OK","data":{"Packages":[
+			 {"PackageCode":"TCACA_code_008_cfWoLwvjU4","CycleTotalCapacity":500,
+			  "CycleRemainCapacity":"40"},
+			 {"PackageCode":"TCACA_code_007_nzdH5h4Nl0","CycleTotalCapacity":100,
+			  "CycleRemainCapacity":100}],"IsPaidUser":false}}`))
+		case pathFreePackages:
+			_, _ = w.Write([]byte(`{"code":0,"data":{"Accounts":[
+			 {"PackageCode":"TCACA_code_008_cfWoLwvjU4","CycleEndTime":"2026-09-30 23:59:59"},
+			 {"PackageCode":"TCACA_code_007_nzdH5h4Nl0","CycleEndTime":1791680409000}]}}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
 		}
-		_, _ = w.Write([]byte(`{"code":0,"data":{"paymentType":"free"}}`))
 	}))
 	defer srv.Close()
 
@@ -170,23 +319,28 @@ func TestFetchQuotaToleratesMixedTimestampTypes(t *testing.T) {
 	if got.Error != "" {
 		t.Fatalf("unexpected error: %s", got.Error)
 	}
-	if got.Left != 500 {
-		t.Errorf("left = %v, want 500 (TotalDosage arrived as a string)", got.Left)
+	if got.Left != 140 {
+		t.Errorf("left = %v, want 140", got.Left)
 	}
 	if len(got.Packages) != 2 {
 		t.Fatalf("packages = %d, want 2", len(got.Packages))
 	}
-	// A formatted CycleEndTime wins over the epoch.
-	if got.Packages[1].CycleEnd != "2026-09-30 23:59:59" {
-		t.Errorf("cycle end = %q", got.Packages[1].CycleEnd)
+	byCode := map[string]quotaPackage{}
+	for _, p := range got.Packages {
+		byCode[p.Code] = p
+	}
+	// A formatted CycleEndTime comes through untouched.
+	if got := byCode["TCACA_code_008_cfWoLwvjU4"].CycleEnd; got != "2026-09-30 23:59:59" {
+		t.Errorf("cycle end = %q", got)
 	}
 	// The epoch-only row is rendered as a local timestamp, not dropped and not
 	// shown as a raw number.
-	if got.Packages[0].CycleEnd == "" || got.Packages[0].CycleEnd == "1791680409000" {
-		t.Errorf("epoch cycle end = %q, want a formatted time", got.Packages[0].CycleEnd)
+	epoch := byCode["TCACA_code_007_nzdH5h4Nl0"].CycleEnd
+	if epoch == "" || epoch == "1791680409000" {
+		t.Errorf("epoch cycle end = %q, want a formatted time", epoch)
 	}
-	if !strings.Contains(got.Packages[0].CycleEnd, "2026-10-11") {
-		t.Errorf("epoch cycle end = %q, want the 2026-10-11 date", got.Packages[0].CycleEnd)
+	if !strings.Contains(epoch, "2026-10-11") {
+		t.Errorf("epoch cycle end = %q, want the 2026-10-11 date", epoch)
 	}
 }
 
@@ -318,6 +472,42 @@ func TestMasking(t *testing.T) {
 	}
 	if got := shortID("abc"); got != "abc" {
 		t.Errorf("shortID short = %q", got)
+	}
+}
+
+// TestRenderQuotaHTMLGroupsFreePackages checks the reason api3 is read at all:
+// the refilling free package is listed apart from the purchases, and an
+// account whose backend sends no slice says so instead of showing a zero.
+func TestRenderQuotaHTMLGroupsFreePackages(t *testing.T) {
+	snapshot := quotaSnapshot{
+		GeneratedAt: time.Now(),
+		Accounts: []quotaAccount{{
+			ID: "workbuddy-uid", Label: "小楚", Region: regionCN, Left: 665.26,
+			Packages: []quotaPackage{
+				{Name: "体验版", Code: "TCACA_code_008_cfWoLwvjU4", Left: 0, Total: 500,
+					CycleEnd: "2026-09-30 23:59:59", Free: true,
+					HasSlice: true, SliceLeft: 0, SliceTotal: 500},
+				{Name: "Free Plan Subscription", Code: "TCACA_code_035_ArVxJcGDsm",
+					Left: 22.71, Total: 100, Free: true},
+				{Name: "Pro 月包", Code: "TCACA_code_002_AkiJS3ZHF5", Left: 642.55, Total: 2000},
+			},
+		}},
+	}
+	page := renderQuotaHTML(snapshot, false)
+	for _, want := range []string{
+		"免费包（周期刷新）", "付费/赠送包", "Pro 月包",
+		"0 / 500", // the slice column
+		"未下发",     // the package with no slice details
+		"665.26",  // fractional totals keep two decimals
+	} {
+		if !strings.Contains(page, want) {
+			t.Errorf("page is missing %q", want)
+		}
+	}
+	// The paid group has no slice column, so the placeholder cell must appear
+	// exactly once: only for the free package that lacks slice details.
+	if n := strings.Count(page, `<span class="quiet">未下发</span>`); n != 1 {
+		t.Errorf("placeholder cell appears %d times, want 1", n)
 	}
 }
 

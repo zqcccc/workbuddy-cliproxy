@@ -210,16 +210,30 @@ suggestion、提示词增强,不能走 chat completions)。
   的 `sk-` 是给 `/v1` 用的,拿它访问会 401。
   两个插件的路由路径必须不同,否则宿主会按优先级丢弃其中一个。
 
-页面数据来自上游 `POST /v2/billing/meter/get-user-resource`,由插件用
-`host.auth.list` / `host.auth.get` 取回**自己名下**的凭据后逐个查询。三个要点:
+页面数据来自两条上游接口(客户端里叫 api1 / api3),由插件用 `host.auth.list` /
+`host.auth.get` 取回**自己名下**的凭据后逐个查询:
+
+| 用途 | 接口 | 说明 |
+| --- | --- | --- |
+| 余额与档位 | `POST /billing/meter/get-user-resource-summary` | body 是 `{}`,返回 `Packages[]{PackageCode, CycleTotalCapacity, CycleRemainCapacity}` 与 `IsPaidUser` |
+| 免费包与刷新周期 | `POST /billing/meter/get-user-resource-free-packages` | 必须带 `PackageCodes`,另带 `Status:[0,3]` 与当天 `SlicePeriodStartTime/EndTime` |
+
+四个要点:
 
 1. **额度是账户级积分池,不是每个模型一份。** 模型只有消耗倍率
    (`GET /v3/config` → `models[].credits`,如 `x0.00` ~ `x5.00`),`x0.00` 表示不扣积分
-   (如 `hy3`、试用中的 `hy4-preview-f`)。单次实际扣费在 chat 响应的 `usage.credit`。
-2. **该接口有两个坑**:只接受 POST(GET 一律 404);必须带
-   `User-Agent: CLI/<ver> CodeBuddy/<ver>`,否则返回 403 `code 10085`(看着像权限问题,
+   (如 `hy3`)。单次实际扣费在 chat 响应的 `usage.credit`。
+   **不存在"按模型的每日限量"**:查遍最新客户端也没有这个概念,每日刷新的是免费包的
+   credits,不是模型维度。
+2. **这两条路由在 API 根路径,没有 `/v2` 前缀。** `/v2/billing/meter/...` 一律 404
+   (老的 `get-user-resource` 才有 `/v2`)。另外它们只接受 POST,且必须带
+   `User-Agent: CLI/<ver> CodeBuddy/<ver>`,否则 403 `code 10085`(看着像权限问题,
    其实只是 UA 校验)。插件已经在 `commonHeaders()` 里处理。
-3. **面板查询不会刷新 token。** 上游 refresh 会轮换 refresh token,而这条路径不写回
+3. **免费包会周期刷新。** `CapacityType == 4` 的包是"分片递减型",当期余量在
+   `SlicePeriodUsageDetails[0]` 的 `SlicePeriod*Precise`。上游**并不对所有账号下发这个
+   明细**(国内体验版实测就没有),缺它就只能显示整个周期的值,页面会标注"未下发"。
+   所以代码里必须保留回落,不能硬取。
+4. **面板查询不会刷新 token。** 上游 refresh 会轮换 refresh token,而这条路径不写回
    凭据,轮换后旧 token 就废了。所以过期账号只提示"请重新登录",不会自己去刷。
 
 资源路由按 CPA 的设计**不走管理鉴权**,因此页面上的账号名与 uid 做了脱敏
@@ -229,6 +243,9 @@ suggestion、提示词增强,不能走 chat completions)。
 
 面板「认证文件」每条凭据的名字后面也会带上余额,形如
 `WorkBuddy (小楚) · 剩 1165 credits`。
+
+余额取的是上面 api1 的实时值。注意老接口 `get-user-resource` 的 `TotalDosage` 是
+**陈旧快照**(实测同一个账号两处差 500),所以这里不用它。
 
 这里有个宿主限制值得记一笔:CPA 的 auth-files 接口确实有 `quota` 字段,但
 `coreauth.ProviderSupportsQuotaObservation()` 把它**硬编码给了 `claude` 和 `codex`

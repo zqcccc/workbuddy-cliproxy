@@ -5,15 +5,25 @@ package main
 // The balance a workbuddy account can still spend is an account-level pool of
 // credits, not a per-model allowance: the model catalog only carries a rate
 // (models[].credits in /v3/config) and the pool is what every model bills
-// against. The pool lives in the billing resource-package list served by
-// /v2/billing/meter/get-user-resource, which is what this file reads.
+// against. There is no per-model quota of any kind — see README.
 //
-// Two upstream quirks are load-bearing here:
+// The pool is split into billing resource packages, and two of them matter:
 //
-//   - the route only accepts POST; a GET is answered 404 by the gateway;
-//   - a "CLI/<ver> CodeBuddy/<ver>" User-Agent is mandatory, otherwise the
-//     gateway answers 403 with code 10085, which reads like a permission
-//     problem but is only a UA check. commonHeaders() already sends it.
+//   - paid/bonus packages, which expire on their own schedule;
+//   - the free plan package, which refills every cycle ("slice"). Packages
+//     with CapacityType 4 are the refilling kind; the client calls them
+//     分片递减型 and reads the current slice from SlicePeriodUsageDetails.
+//
+// Both are read from the two newer billing routes, api1 and api3 in the
+// client's own naming. Two upstream quirks are load-bearing here:
+//
+//   - these routes live at the API *root*, with no /v2 prefix. /v2/billing/
+//     meter/... answers 404 for them, and the prefix is what the older
+//     get-user-resource route uses, so it is an easy thing to get wrong;
+//   - they only accept POST, and a "CLI/<ver> CodeBuddy/<ver>" User-Agent is
+//     mandatory, otherwise the gateway answers 403 with code 10085, which
+//     reads like a permission problem but is only a UA check.
+//     commonHeaders() already sends it.
 
 import (
 	"bytes"
@@ -31,12 +41,13 @@ import (
 )
 
 const (
-	pathUserResource = "/v2/billing/meter/get-user-resource"
+	// pathResourceSummary is "api1": the balance, plan tier and paid status,
+	// aggregated per package code. No /v2 prefix — see the file comment.
+	pathResourceSummary = "/billing/meter/get-user-resource-summary"
+	// pathFreePackages is "api3": the free packages with their current
+	// refilling slice. Also at the API root.
+	pathFreePackages = "/billing/meter/get-user-resource-free-packages"
 	pathPaymentType  = "/v2/billing/meter/get-payment-type"
-
-	// quotaProductCode is the CodeBuddy billing product. It is the same on
-	// both realms; without it the endpoint answers 403/10085.
-	quotaProductCode = "p_tcaca"
 
 	// quotaCacheTTL keeps a management page refresh from firing one upstream
 	// round trip per credential on every click.
@@ -48,6 +59,65 @@ const (
 	quotaTimeout = 10 * time.Second
 )
 
+// freePackageCodes is the client's FREE_PACKAGE_CODES list: the packages that
+// are free rather than purchased. api3 requires PackageCodes to be sent —
+// without it the route answers 400 / 10001 "PackageCodes required" — and it
+// only ever returns these codes, so sending anything else is pointless.
+var freePackageCodes = []string{
+	"TCACA_code_001_PqouKr6QWV", // free
+	"TCACA_code_008_cfWoLwvjU4", // freeMon: CN 体验版
+	"TCACA_code_035_ArVxJcGDsm", // freeMonIntl
+	"TCACA_code_006_DbXS0lrypC", // gift
+	"TCACA_code_039_KRcQj7wUat", // proTrialMon
+	"TCACA_code_040_mi9rCYg46x", // proTrialYear
+	"TCACA_code_007_nzdH5h4Nl0", // activity
+	"TCACA_code_028_NtpWi0jzXs", // bonus28
+	"TCACA_code_037_WxOD3MpI2o", // bonusIntl
+	"TCACA_code_029_6wCGEWquYy", // bonus29
+	"TCACA_code_030_BjSt89qTvr", // bonus30
+}
+
+// packageDisplayNames maps a commodity code to a readable name. api1 returns
+// only codes, so without this the page would show raw TCACA_code_... strings.
+// Upstream PackageName wins when api3 supplies it; this is the fallback.
+var packageDisplayNames = map[string]string{
+	"TCACA_code_001_PqouKr6QWV": "免费版",
+	"TCACA_code_002_AkiJS3ZHF5": "Pro 月包",
+	"TCACA_code_003_FAnt7lcmRT": "Pro 年包",
+	"TCACA_code_005_maRGyrHhw1": "Pro 月包 Plus",
+	"TCACA_code_006_DbXS0lrypC": "赠送包（Pro 试用）",
+	"TCACA_code_007_nzdH5h4Nl0": "运营裂变包",
+	"TCACA_code_008_cfWoLwvjU4": "体验版（周期刷新）",
+	"TCACA_code_009_0XmEQc2xOf": "加量包",
+	"TCACA_code_023_4xbGhMrE6q": "青春版",
+	"TCACA_code_026_BaESVICNoi": "高级版",
+	"TCACA_code_027_0FCGVA6vSa": "旗舰版",
+	"TCACA_code_028_NtpWi0jzXs": "赠送包 28",
+	"TCACA_code_029_6wCGEWquYy": "赠送包 29",
+	"TCACA_code_030_BjSt89qTvr": "赠送包 30",
+	"TCACA_code_035_ArVxJcGDsm": "Free Plan（周期刷新）",
+	"TCACA_code_036_lupO5WgNdG": "加量包（国际）",
+	"TCACA_code_037_WxOD3MpI2o": "赠送包（国际）",
+	"TCACA_code_038_OhvqZtiPKr": "加量包",
+	"TCACA_code_039_KRcQj7wUat": "Pro 试用（月）",
+	"TCACA_code_040_mi9rCYg46x": "Pro 试用（年）",
+}
+
+// isFreePackageCode reports whether a package is one of the free codes, which
+// is what decides which group the page files it under.
+func isFreePackageCode(code string) bool {
+	for _, c := range freePackageCodes {
+		if strings.EqualFold(c, strings.TrimSpace(code)) {
+			return true
+		}
+	}
+	return false
+}
+
+// capacityTypeSlice is the billing CapacityType meaning "refills every slice
+// period" (the client's 分片递减型). The free plan package carries it.
+const capacityTypeSlice = 4
+
 // quotaPackage is one billing resource package: a block of credits with its
 // own validity window.
 type quotaPackage struct {
@@ -56,6 +126,15 @@ type quotaPackage struct {
 	Left     float64 `json:"left"`
 	Total    float64 `json:"total"`
 	CycleEnd string  `json:"cycle_end,omitempty"`
+	// Free marks the free-plan/bonus packages, which refill on a cycle rather
+	// than being bought once.
+	Free bool `json:"free,omitempty"`
+	// Slice* carry the current refill period when upstream reports one. They
+	// are absent for accounts whose backend does not emit slice details, in
+	// which case Left/Total (the full cycle) are the only figures available.
+	SliceLeft  float64 `json:"slice_left,omitempty"`
+	SliceTotal float64 `json:"slice_total,omitempty"`
+	HasSlice   bool    `json:"has_slice,omitempty"`
 }
 
 // quotaAccount is the balance of one stored credential.
@@ -90,18 +169,30 @@ var (
 // Upstream calls
 // ---------------------------------------------------------------------------
 
-// resourceRequestBody builds the paging/validity window the endpoint expects.
-// Without the time range the gateway treats the call as malformed.
-func resourceRequestBody() []byte {
+// summaryRequestBody builds api1's request. It takes no business parameters:
+// the route aggregates the whole account, so an empty object is correct.
+func summaryRequestBody() []byte {
+	return []byte(`{}`)
+}
+
+// freePackagesRequestBody builds api3's request.
+//
+// PackageCodes is mandatory — omitting it makes the route answer 400 with code
+// 10001 — and the slice range is what makes upstream attach the current
+// refill period to each package. The range is today, because the slice is a
+// daily window.
+func freePackagesRequestBody() []byte {
 	const layout = "2006-01-02 15:04:05"
 	now := time.Now()
+	start := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	end := start.AddDate(0, 0, 1).Add(-time.Second)
 	body := map[string]any{
-		"PageNumber":               1,
-		"PageSize":                 100,
-		"ProductCode":              quotaProductCode,
-		"Status":                   []int{0, 3},
-		"PackageEndTimeRangeBegin": now.Format(layout),
-		"PackageEndTimeRangeEnd":   now.AddDate(10, 0, 0).Format(layout),
+		"PageNumber":           1,
+		"PageSize":             100,
+		"PackageCodes":         freePackageCodes,
+		"Status":               []int{0, 3},
+		"SlicePeriodStartTime": start.Format(layout),
+		"SlicePeriodEndTime":   end.Format(layout),
 	}
 	raw, err := json.Marshal(body)
 	if err != nil {
@@ -110,21 +201,105 @@ func resourceRequestBody() []byte {
 	return raw
 }
 
-// resourceResponse is the subset of the billing payload we render. The fields
-// are PascalCase because the endpoint proxies a Tencent billing API verbatim.
+// summaryResponse is api1's payload: one entry per package code with the
+// cycle figures, plus whether the account is a paying one.
 //
-// Accounts is decoded as raw maps rather than a typed struct: upstream mixes
-// string and number for the same field (a live account returned
-// DeductionEndTime as a millisecond epoch), and a strict struct turns any such
-// drift into a failed lookup for the whole account. Reading field by field
-// degrades one value instead of the whole page.
-type resourceResponse struct {
-	Response struct {
-		Data struct {
-			TotalDosage any              `json:"TotalDosage"`
-			Accounts    []map[string]any `json:"Accounts"`
-		} `json:"Data"`
-	} `json:"Response"`
+// Packages is decoded as raw maps for the same reason as the free packages
+// below: upstream mixes strings and numbers, and a strict struct turns a
+// drift in one account into a failed lookup for the whole page.
+type summaryResponse struct {
+	Packages   []map[string]any `json:"Packages"`
+	IsPaidUser bool             `json:"IsPaidUser"`
+}
+
+// freePackagesResponse is api3's payload. Only SlicePeriodUsageDetails is read
+// from it; the rest duplicates api1 at a coarser granularity.
+type freePackagesResponse struct {
+	Accounts []map[string]any `json:"Accounts"`
+}
+
+// sliceUsage is the current refill period of one package.
+type sliceUsage struct {
+	left  float64
+	total float64
+}
+
+// packageFacts is what api3 adds to a package api1 already described: a
+// readable name, when the cycle ends, and the current refill slice.
+type packageFacts struct {
+	name     string
+	cycleEnd string
+	slice    *sliceUsage
+}
+
+// freePackageFacts reads api3 and indexes it by package code.
+//
+// It is best-effort: api3 only enriches what api1 already returned, so a
+// failure here must not hide the balance. Accounts whose backend does not
+// emit SlicePeriodUsageDetails simply come back without a slice, and the
+// caller keeps showing the full-cycle figures.
+func freePackageFacts(base string, sa *storedAuth) map[string]packageFacts {
+	facts := map[string]packageFacts{}
+	data, _, err := quotaHTTP(base, sa, pathFreePackages, freePackagesRequestBody())
+	if err != nil {
+		return facts
+	}
+	var res freePackagesResponse
+	if err := json.Unmarshal(data, &res); err != nil {
+		return facts
+	}
+	for _, pkg := range res.Accounts {
+		code := packageCode(pkg)
+		if code == "" {
+			continue
+		}
+		fact := facts[code]
+		if name := packageName(pkg); name != "" {
+			fact.name = name
+		}
+		if end := cycleEndValue(pkg["CycleEndTime"]); end != "" {
+			fact.cycleEnd = end
+		}
+		if size, left, ok := sliceOf(pkg); ok {
+			fact.slice = &sliceUsage{left: left, total: size}
+		}
+		facts[code] = fact
+	}
+	return facts
+}
+
+// sliceOf reads the current refill period out of one api3 package.
+//
+// Upstream omits SlicePeriodUsageDetails for some packages entirely (the
+// client carries a comment saying the CN free plan is one of them), and a
+// missing slice is not an error: the caller falls back to the cycle figures.
+func sliceOf(pkg map[string]any) (size, left float64, ok bool) {
+	details, _ := pkg["SlicePeriodUsageDetails"].([]any)
+	if len(details) == 0 {
+		return 0, 0, false
+	}
+	slice, _ := details[0].(map[string]any)
+	if slice == nil {
+		return 0, 0, false
+	}
+	size = numericValue(slice["SlicePeriodCapacitySizePrecise"])
+	left = numericValue(slice["SlicePeriodCapacityRemainPrecise"])
+	if size == 0 && left == 0 {
+		return 0, 0, false
+	}
+	return size, left, true
+}
+
+// packageDisplayName prefers the name upstream sent, then the local code map,
+// and falls back to the raw code so a new package is still visible.
+func packageDisplayName(code, upstream string) string {
+	if name := strings.TrimSpace(upstream); name != "" {
+		return name
+	}
+	if name := packageDisplayNames[code]; name != "" {
+		return name
+	}
+	return code
 }
 
 // packageName and packageCode read the two label fields tolerantly.
@@ -235,7 +410,7 @@ func fetchQuotaFrom(base string, sa *storedAuth) quotaAccount {
 		UID:    sa.Account.UID,
 		Region: normalizeRegion(sa.Region),
 	}
-	data, status, err := quotaHTTP(base, sa, pathUserResource, resourceRequestBody())
+	data, status, err := quotaHTTP(base, sa, pathResourceSummary, summaryRequestBody())
 	if err != nil {
 		if status == http.StatusUnauthorized || status == http.StatusForbidden {
 			out.Error = "登录已过期，请在 CPA 面板重新登录该账号"
@@ -244,29 +419,31 @@ func fetchQuotaFrom(base string, sa *storedAuth) quotaAccount {
 		}
 		return out
 	}
-	var res resourceResponse
+	var res summaryResponse
 	if err := json.Unmarshal(data, &res); err != nil {
 		out.Error = "parse failed: " + err.Error()
 		return out
 	}
-	for _, pkg := range res.Response.Data.Accounts {
-		cycle := cycleEndValue(pkg["CycleEndTime"])
-		if cycle == "" {
-			cycle = cycleEndValue(pkg["DeductionEndTime"])
+	facts := freePackageFacts(base, sa)
+	for _, pkg := range res.Packages {
+		code := packageCode(pkg)
+		p := quotaPackage{
+			Name:  packageDisplayName(code, facts[code].name),
+			Code:  code,
+			Left:  numericValue(pkg["CycleRemainCapacity"]),
+			Total: numericValue(pkg["CycleTotalCapacity"]),
+			Free:  isFreePackageCode(code),
 		}
-		out.Packages = append(out.Packages, quotaPackage{
-			Name:     packageName(pkg),
-			Code:     packageCode(pkg),
-			Left:     numericValue(pkg["CycleCapacityRemainPrecise"]),
-			Total:    numericValue(pkg["CycleCapacitySizePrecise"]),
-			CycleEnd: cycle,
-		})
-	}
-	out.Left = numericValue(res.Response.Data.TotalDosage)
-	if out.Left == 0 {
-		for _, p := range out.Packages {
-			out.Left += p.Left
+		if fact, ok := facts[code]; ok {
+			p.CycleEnd = fact.cycleEnd
+			if fact.slice != nil {
+				p.HasSlice = true
+				p.SliceLeft = fact.slice.left
+				p.SliceTotal = fact.slice.total
+			}
 		}
+		out.Packages = append(out.Packages, p)
+		out.Left += p.Left
 	}
 	// The plan type is cosmetic; a failure to read it must not hide the
 	// balance we just fetched.
@@ -278,11 +455,29 @@ func fetchQuotaFrom(base string, sa *storedAuth) quotaAccount {
 			out.Plan = plan.PaymentType
 		}
 	}
-	sort.Slice(out.Packages, func(i, j int) bool {
-		if out.Packages[i].Left == out.Packages[j].Left {
-			return out.Packages[i].Name < out.Packages[j].Name
+	if out.Plan == "" {
+		// api1 already knows whether this is a paying account; use it when the
+		// dedicated route gave nothing.
+		if res.IsPaidUser {
+			out.Plan = "paid"
+		} else {
+			out.Plan = "free"
 		}
-		return out.Packages[i].Left > out.Packages[j].Left
+	}
+	sort.Slice(out.Packages, func(i, j int) bool {
+		a, b := out.Packages[i], out.Packages[j]
+		// The refilling package is the one an operator is watching, so it
+		// leads; the rest of the free group follows, then the purchases.
+		if a.HasSlice != b.HasSlice {
+			return a.HasSlice
+		}
+		if a.Free != b.Free {
+			return a.Free
+		}
+		if a.Left == b.Left {
+			return a.Name < b.Name
+		}
+		return a.Left > b.Left
 	})
 	return out
 }
