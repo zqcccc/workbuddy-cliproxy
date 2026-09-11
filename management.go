@@ -48,9 +48,12 @@ func handleManagementRegister(raw []byte) ([]byte, error) {
 
 	return okEnvelope(pluginapi.ManagementRegistrationResponse{
 		Routes: []pluginapi.ManagementRoute{{
-			Method:      http.MethodGet,
-			Path:        base + "/workbuddy/quota",
-			Description: "workbuddy 各账号剩余积分（JSON，需管理鉴权）",
+			Method: http.MethodGet,
+			// The path must be per-plugin: CN and Global are two plugins, and
+			// registering the same path from both makes the host skip the
+			// lower-priority one ("conflicts with a higher-priority plugin").
+			Path:        base + "/" + providerName + "/quota",
+			Description: "workbuddy 各账号剩余积分(JSON,需管理鉴权)",
 		}},
 		Resources: []pluginapi.ResourceRoute{{
 			Path:        quotaResourcePath,
@@ -73,6 +76,11 @@ func handleManagement(raw []byte) ([]byte, error) {
 	}
 	force := strings.TrimSpace(req.Query.Get("refresh")) != ""
 	snapshot := collectQuota(force)
+	hostLog("info", "workbuddy: balance page served", map[string]any{
+		"path":     req.Path,
+		"accounts": len(snapshot.Accounts),
+		"refresh":  force,
+	})
 
 	// Resource routes are public; hand them the masked HTML page. Everything
 	// under /v0/management is already authenticated by the host, so it gets

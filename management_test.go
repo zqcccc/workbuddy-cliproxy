@@ -47,6 +47,11 @@ func TestManagementRegisterAdvertisesBalanceRoutes(t *testing.T) {
 	if !strings.HasPrefix(resp.Routes[0].Path, "/v0/management/") {
 		t.Errorf("route path = %q, want it under /v0/management/", resp.Routes[0].Path)
 	}
+	// CN and Global are separate plugins registering separate routes; sharing
+	// one path makes the host drop the lower-priority one.
+	if !strings.Contains(resp.Routes[0].Path, providerName) {
+		t.Errorf("route path = %q, want it scoped to provider %q", resp.Routes[0].Path, providerName)
+	}
 	if resp.Routes[0].Method != http.MethodGet {
 		t.Errorf("route method = %q, want GET", resp.Routes[0].Method)
 	}

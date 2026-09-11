@@ -42,7 +42,10 @@ const (
 	// round trip per credential on every click.
 	quotaCacheTTL = 60 * time.Second
 
-	quotaTimeout = 25 * time.Second
+	// quotaTimeout bounds one balance lookup. Keep it short: auth.parse is on
+	// the host's synchronous credential-loading path, and a slow billing
+	// endpoint must not stall a startup or a credential rescan.
+	quotaTimeout = 10 * time.Second
 )
 
 // quotaPackage is one billing resource package: a block of credits with its
@@ -282,6 +285,42 @@ func fetchQuotaFrom(base string, sa *storedAuth) quotaAccount {
 		return out.Packages[i].Left > out.Packages[j].Left
 	})
 	return out
+}
+
+// cachedAccountBalance memoises one balance per account for a short window.
+//
+// The host parses the same credential several times during a single reload
+// (initial load, model discovery, ...), and every parse used to cost an
+// upstream round trip. A minute of caching collapses those repeats while
+// keeping a manual host refresh responsive.
+func cachedAccountBalance(sa *storedAuth) quotaAccount {
+	key := strings.TrimSpace(sa.Account.UID)
+	if key == "" {
+		key = accountIdentity(sa)
+	}
+	quotaMu.Lock()
+	entry, ok := quotaBalanceCache[key]
+	if ok && time.Since(entry.at) < quotaCacheTTL {
+		quotaMu.Unlock()
+		return entry.account
+	}
+	quotaMu.Unlock()
+
+	account := fetchQuota(sa)
+
+	quotaMu.Lock()
+	quotaBalanceCache[key] = quotaBalanceEntry{account: account, at: time.Now()}
+	quotaMu.Unlock()
+	return account
+}
+
+var (
+	quotaBalanceCache = map[string]quotaBalanceEntry{}
+)
+
+type quotaBalanceEntry struct {
+	account quotaAccount
+	at      time.Time
 }
 
 // quotaLabel is the human-readable name shown next to a balance.

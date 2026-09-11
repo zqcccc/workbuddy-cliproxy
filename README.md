@@ -203,10 +203,12 @@ suggestion、提示词增强,不能走 chat completions)。
 
 - 页面地址:`/v0/resource/plugins/<pluginID>/quota`,例如
   `http://<host>:8317/v0/resource/plugins/workbuddy/quota`
-- 需要原始数据时用鉴权路由:`/v0/management/workbuddy/quota`(返回 JSON,
-  账号名/uid 不脱敏)。加 `?refresh=1` 可跳过 60 秒缓存强制重查。
+- 需要原始数据时用鉴权路由:`/v0/management/workbuddy/quota`(Global 插件是
+  `/v0/management/workbuddy-global/quota`),返回 JSON,账号名/uid 不脱敏。
+  加 `?refresh=1` 可跳过 60 秒缓存强制重查。
   注意这里要的是 **management key**(`remote-management.secret-key`),`api-keys` 里
   的 `sk-` 是给 `/v1` 用的,拿它访问会 401。
+  两个插件的路由路径必须不同,否则宿主会按优先级丢弃其中一个。
 
 页面数据来自上游 `POST /v2/billing/meter/get-user-resource`,由插件用
 `host.auth.list` / `host.auth.get` 取回**自己名下**的凭据后逐个查询。三个要点:
@@ -222,6 +224,21 @@ suggestion、提示词增强,不能走 chat completions)。
 
 资源路由按 CPA 的设计**不走管理鉴权**,因此页面上的账号名与 uid 做了脱敏
 (`知***` / `98e520f0…`)。要完整信息请用上面的 `/v0/management/...` JSON 路由。
+
+### 认证文件列表里的额度
+
+面板「认证文件」每条凭据的名字后面也会带上余额,形如
+`WorkBuddy (小楚) · 剩 1165 credits`。
+
+这里有个宿主限制值得记一笔:CPA 的 auth-files 接口确实有 `quota` 字段,但
+`coreauth.ProviderSupportsQuotaObservation()` 把它**硬编码给了 `claude` 和 `codex`
+两个内置 provider**,外部插件填不进去,所以 Codex 那种"刷新额度"的展示方式对
+workbuddy 用不了。能用的只剩每条凭据的 `label`,于是余额挂在名字后面。
+
+更新时机是宿主 `auth.parse`(重启、凭据文件变化)和 `auth.refresh`(token 续期),
+两者都是"宿主把凭据交给插件、插件交还后由宿主落盘",没有并发写的问题。
+**插件不会用 `host.auth.save` 回写**:那是整文件覆盖,和宿主自己的 refresh 抢写,
+一旦覆盖到旧 token 就把凭据弄废了。
 
 ## 安装
 

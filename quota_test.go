@@ -190,6 +190,43 @@ func TestFetchQuotaToleratesMixedTimestampTypes(t *testing.T) {
 	}
 }
 
+func TestAppendBalanceToLabel(t *testing.T) {
+	base := "WorkBuddy (知了十八)"
+	cases := []struct {
+		name string
+		acc  quotaAccount
+		want string
+	}{
+		{"balance", quotaAccount{Left: 1640}, base + " · 剩 1640 credits"},
+		{"fractional", quotaAccount{Left: 840.36}, base + " · 剩 840.36 credits"},
+		{"zero balance still shown", quotaAccount{Left: 0}, base + " · 剩 0 credits"},
+		// A failed lookup must leave the label untouched rather than printing
+		// a misleading "0".
+		{"lookup failed", quotaAccount{Error: "登录已过期"}, base},
+	}
+	for _, c := range cases {
+		if got := appendBalance(base, c.acc); got != c.want {
+			t.Errorf("%s: appendBalance = %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+func TestBaseAuthLabel(t *testing.T) {
+	sa := testStoredAuth()
+	if got, want := baseAuthLabel(sa), "WorkBuddy (知了十八)"; got != want {
+		t.Errorf("cn label = %q, want %q", got, want)
+	}
+	sa.Region = regionGlobal
+	if got, want := baseAuthLabel(sa), "WorkBuddy (知了十八) · Global"; got != want {
+		t.Errorf("global label = %q, want %q", got, want)
+	}
+	// The balance suffix is rebuilt from the base label every time, so it can
+	// never accumulate across refreshes.
+	if got := appendBalance(baseAuthLabel(sa), quotaAccount{Left: 350}); got != "WorkBuddy (知了十八) · Global · 剩 350 credits" {
+		t.Errorf("global label with balance = %q", got)
+	}
+}
+
 func TestNumericValue(t *testing.T) {
 	cases := []struct {
 		in   any

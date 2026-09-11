@@ -724,17 +724,57 @@ func handleParseAuth(raw []byte) ([]byte, error) {
 	}
 	sa, err := parseStored(req.RawJSON)
 	if err != nil {
-		// Not a workbuddy credential; let the host try other providers.
+		// Not a workbuddy credential; let the host try other providers. The
+		// balance lookup below must stay behind this check, otherwise every
+		// unrelated credential would trigger an upstream call.
 		return okEnvelope(pluginapi.AuthParseResponse{Handled: false})
 	}
 	return okEnvelope(pluginapi.AuthParseResponse{
 		Handled: true,
-		Auth:    toAuthData(sa),
+		Auth:    authDataWithBalance(sa),
 	})
+}
+
+// authDataWithBalance is toAuthData with the remaining credits appended to the
+// label, so the balance shows up next to the credential in the host's
+// auth-files list. A failed lookup keeps the plain label: parsing must never
+// fail because the billing endpoint was unreachable.
+func authDataWithBalance(sa *storedAuth) pluginapi.AuthData {
+	auth := toAuthData(sa)
+	acc := cachedAccountBalance(sa)
+	if acc.Error != "" {
+		hostLog("info", "workbuddy: balance lookup failed, label left plain", map[string]any{
+			"uid":   sa.Account.UID,
+			"error": acc.Error,
+		})
+		return auth
+	}
+	hostLog("info", "workbuddy: balance attached to credential label", map[string]any{
+		"uid":  sa.Account.UID,
+		"left": acc.Left,
+	})
+	auth.Label = appendBalance(baseAuthLabel(sa), acc)
+	return auth
 }
 
 func toAuthData(sa *storedAuth) pluginapi.AuthData {
 	storage, _ := json.Marshal(sa)
+	identity := accountIdentity(sa)
+	return pluginapi.AuthData{
+		Provider: providerName,
+		// Per-account ID and file name: this is what lets several CodeBuddy
+		// accounts (CN and Global alike) live side by side in the auth store.
+		ID:          providerName + "-" + identity,
+		FileName:    providerName + "-" + identity + ".json",
+		Prefix:      configuredModelPrefix(),
+		Label:       baseAuthLabel(sa),
+		StorageJSON: storage,
+		Metadata:    map[string]any{"type": providerName, "region": normalizeRegion(sa.Region)},
+	}
+}
+
+// baseAuthLabel is the credential name shown in the host UI.
+func baseAuthLabel(sa *storedAuth) string {
 	identity := accountIdentity(sa)
 	label := "WorkBuddy"
 	if nickname := strings.TrimSpace(sa.Account.Nickname); nickname != "" {
@@ -745,17 +785,21 @@ func toAuthData(sa *storedAuth) pluginapi.AuthData {
 	if normalizeRegion(sa.Region) == regionGlobal {
 		label += " · Global"
 	}
-	return pluginapi.AuthData{
-		Provider: providerName,
-		// Per-account ID and file name: this is what lets several CodeBuddy
-		// accounts (CN and Global alike) live side by side in the auth store.
-		ID:          providerName + "-" + identity,
-		FileName:    providerName + "-" + identity + ".json",
-		Prefix:      configuredModelPrefix(),
-		Label:       label,
-		StorageJSON: storage,
-		Metadata:    map[string]any{"type": providerName, "region": normalizeRegion(sa.Region)},
+	return label
+}
+
+// appendBalance adds the remaining credit balance to a credential label.
+//
+// The host renders a "quota" field in its auth-files list, but only for the
+// providers built into it: coreauth.ProviderSupportsQuotaObservation accepts
+// "claude" and "codex" and nothing else, so a plugin can never fill it. The
+// label is the one per-credential string a plugin does control, so the balance
+// rides along there ("WorkBuddy (小楚) · 剩 1640 credits").
+func appendBalance(label string, acc quotaAccount) string {
+	if acc.Error != "" {
+		return label
 	}
+	return label + " · 剩 " + formatCredits(acc.Left) + " credits"
 }
 
 // otherRegion returns the realm that is not the one given.
@@ -957,7 +1001,12 @@ func handleRefreshAuth(raw []byte) ([]byte, error) {
 		sa.Auth.Domain = tok.Domain
 	}
 	sa.Auth.ExpiresAt = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).Unix()
-	return okEnvelope(pluginapi.AuthRefreshResponse{Auth: toAuthData(sa)})
+	// Refresh and parse are the moments the host hands a credential to us and
+	// persists what we hand back, so they are the safe places to write the
+	// balance into the label. host.auth.save would overwrite the whole auth
+	// file instead, which races the host's own refresh and can persist a stale
+	// token. A failed balance lookup must not fail the refresh.
+	return okEnvelope(pluginapi.AuthRefreshResponse{Auth: authDataWithBalance(sa)})
 }
 
 // -----------------------------------------------------------------------------
