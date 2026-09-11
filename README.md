@@ -125,6 +125,24 @@ suggestion、提示词增强,不能走 chat completions)。
   `model.for_auth` 拉取失败时的兜底(此时它挂在该凭据下,是可路由的)。
 - 上游给的字段缺失时才用默认值(上下文 200000、输出 8192)。
 
+### 上下文窗口怎么算
+
+部分模型(如 `hy4-preview`、`deepseek-v4.1-flash`)的目录里除了 `maxInputTokens` 还有一段可
+选预算:
+
+```json
+"contextWindow": {"defaultLength": 200000, "supportedLengths": [200000, 1000000]},
+"maxInputTokens": 1000000
+```
+
+`maxInputTokens` 是**硬上限**,`contextWindow.defaultLength` 才是这个账号**默认实际能用**的窗口
+(CodeBuddy CLI 的 `resolveEffectiveContextBudget` 就是这么算压缩阈值的)。直接把硬上限当成上下文
+报给下游,Claude Code / Cline 这类客户端会照着 100 万去装 prompt,结果上游按 20 万拒。
+
+所以按 CLI 的同款逻辑解析:可选预算里命中 `defaultLength` 就用它,否则用最小的 `supportedLengths`,
+只有一个可选值(等于没有预算)时退回 `maxInputTokens`,并且**永远不会超过 `maxInputTokens`**。
+没有 `contextWindow` 的模型行为不变。
+
 ### 上游目录不全时:`extra_models`
 
 `/v3/config` 并不总是完整。**国际版实测会漏掉整个 hy4 系列** —— 拿 OAuth token 直接调
@@ -270,7 +288,7 @@ workbuddy 用不了。能用的只剩每条凭据的 `label`,于是余额挂在�
 **前置**:运行中的 CLIProxyAPI v7.2.x(带 CGO / 插件支持)、CodeBuddy 账号、Go 1.26+ 与 gcc;编译架构需与 CPA 实例一致(amd64 / arm64)。
 
 ```bash
-git clone https://github.com/lovingfish/workbuddy-cliproxy.git
+git clone https://github.com/zqcccc/workbuddy-cliproxy.git
 cd workbuddy-cliproxy
 CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
   go build -buildmode=c-shared -o workbuddy.so .

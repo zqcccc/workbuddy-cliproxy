@@ -1,4 +1,4 @@
-module github.com/lovingfish/workbuddy-cliproxy
+module github.com/zqcccc/workbuddy-cliproxy
 
 go 1.26.0
 

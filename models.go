@@ -32,18 +32,37 @@ const (
 // upstreamModel mirrors one entry of the CodeBuddy model catalog. Field names
 // match the schema served by /v3/config and bundled in product-ide-cn.json.
 type upstreamModel struct {
-	ID                string `json:"id"`
-	Name              string `json:"name"`
-	Vendor            string `json:"vendor"`
-	DescriptionZh     string `json:"descriptionZh"`
-	DescriptionEn     string `json:"descriptionEn"`
-	MaxInputTokens    int64  `json:"maxInputTokens"`
-	MaxOutputTokens   int64  `json:"maxOutputTokens"`
-	SupportsToolCall  bool   `json:"supportsToolCall"`
-	SupportsImages    bool   `json:"supportsImages"`
-	SupportsReasoning bool   `json:"supportsReasoning"`
-	OnlyReasoning     bool   `json:"onlyReasoning"`
-	IsDefault         bool   `json:"isDefault"`
+	ID                string         `json:"id"`
+	Name              string         `json:"name"`
+	Vendor            string         `json:"vendor"`
+	DescriptionZh     string         `json:"descriptionZh"`
+	DescriptionEn     string         `json:"descriptionEn"`
+	ContextWindow     *contextWindow `json:"contextWindow"`
+	MaxAllowedSize    int64          `json:"maxAllowedSize"`
+	MaxInputTokens    int64          `json:"maxInputTokens"`
+	MaxOutputTokens   int64          `json:"maxOutputTokens"`
+	SupportsToolCall  bool           `json:"supportsToolCall"`
+	SupportsImages    bool           `json:"supportsImages"`
+	SupportsReasoning bool           `json:"supportsReasoning"`
+	OnlyReasoning     bool           `json:"onlyReasoning"`
+	IsDefault         bool           `json:"isDefault"`
+}
+
+// contextWindow is the newer selectable context-budget block the catalog
+// carries alongside maxInputTokens, e.g.
+//
+//	"contextWindow": {"defaultLength": 300000, "supportedLengths": [300000, 1000000]}
+//
+// Some models are sold with a default window smaller than the hard input cap
+// (hy4-preview: default 200000, maxInputTokens 1000000). The CodeBuddy CLI
+// computes its compaction budget with resolveEffectiveContextBudget, which
+// prefers defaultLength whenever it is one of the supported lengths, and only
+// falls back to maxInputTokens when there is no selectable window. Advertising
+// the hard cap instead makes downstream clients (Claude Code, Cline, ...) pack
+// prompts the account cannot actually serve, so mirror the CLI's resolution.
+type contextWindow struct {
+	DefaultLength    int64   `json:"defaultLength"`
+	SupportedLengths []int64 `json:"supportedLengths"`
 }
 
 // serviceModelPrefixes are internal, non-conversational models that CodeBuddy
@@ -241,6 +260,58 @@ func looksLikeModelSpec(fields map[string]json.RawMessage) bool {
 // Conversion
 // -----------------------------------------------------------------------------
 
+// effectiveContextLength resolves the context window this account can actually
+// use for a model. It mirrors resolveEffectiveContextBudget in the CodeBuddy
+// CLI: a selectable contextWindow wins over the raw input cap, because the
+// platform bills and enforces the default length unless a session explicitly
+// selects a bigger budget. It never reports more than maxInputTokens, so a
+// client that trusts the advertised window cannot overrun the hard limit.
+func (m upstreamModel) effectiveContextLength() int64 {
+	if m.ContextWindow == nil {
+		return m.MaxInputTokens
+	}
+	supported := normalizeContextLengths(m.ContextWindow.SupportedLengths, m.MaxInputTokens)
+	if d := m.ContextWindow.DefaultLength; d > 0 && len(supported) >= 2 {
+		for _, candidate := range supported {
+			if candidate == d {
+				return d
+			}
+		}
+	}
+	if len(supported) >= 2 {
+		return supported[0]
+	}
+	return m.MaxInputTokens
+}
+
+// normalizeContextLengths keeps the positive, safe lengths the catalog offers,
+// sorted ascending and capped at the hard input limit. Entries above
+// maxInputTokens are not selectable, and duplicates would otherwise let one
+// bogus value win the default match twice. A missing maxInputTokens means the
+// catalog set no cap, so nothing is filtered out.
+func normalizeContextLengths(lengths []int64, maxInputTokens int64) []int64 {
+	out := make([]int64, 0, len(lengths))
+	for _, length := range lengths {
+		if length <= 0 {
+			continue
+		}
+		if maxInputTokens > 0 && length > maxInputTokens {
+			continue
+		}
+		out = append(out, length)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	// Drop duplicates so a repeated length cannot make a single real option
+	// look like a selectable budget.
+	kept := out[:0]
+	for _, length := range out {
+		if len(kept) == 0 || kept[len(kept)-1] != length {
+			kept = append(kept, length)
+		}
+	}
+	return kept
+}
+
 func toModelInfos(models []upstreamModel) []pluginapi.ModelInfo {
 	out := make([]pluginapi.ModelInfo, 0, len(models))
 	for _, m := range models {
@@ -251,7 +322,7 @@ func toModelInfos(models []upstreamModel) []pluginapi.ModelInfo {
 		if display == "" {
 			display = m.ID
 		}
-		contextLength := m.MaxInputTokens
+		contextLength := m.effectiveContextLength()
 		if contextLength <= 0 {
 			contextLength = defaultContextLength
 		}
