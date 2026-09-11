@@ -60,6 +60,8 @@ import "C"
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -72,29 +74,102 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"gopkg.in/yaml.v3"
 )
 
 const (
-	providerName  = "workbuddy"
-	authFileName  = "workbuddy.json"
-	upstreamBase  = "https://copilot.tencent.com"
-	clientUA      = "CLI/2.63.2 CodeBuddy/2.63.2"
-	originReferer = "https://www.codebuddy.cn"
+	providerName = "workbuddy"
+	// authFileName is the legacy single-account file name. It is kept only so
+	// an already-stored workbuddy.json still parses; every account written from
+	// now on uses workbuddy-<identity>.json so multiple accounts can coexist.
+	authFileName = "workbuddy.json"
+	clientUA     = "CLI/2.63.2 CodeBuddy/2.63.2"
 
-	endpointAuthState    = upstreamBase + "/v2/plugin/auth/state?platform=CLI"
-	endpointLoginAcct    = upstreamBase + "/v2/plugin/login/account?state="
-	endpointAuthToken    = upstreamBase + "/v2/plugin/auth/token?state="
-	endpointTokenRefresh = upstreamBase + "/v2/plugin/auth/token/refresh"
-	endpointChat         = upstreamBase + "/v2/chat/completions"
+	// Both realms serve the exact same plugin API paths; only the host differs.
+	regionCN     = "cn"
+	regionGlobal = "global"
+
+	baseCN       = "https://copilot.tencent.com"
+	baseGlobal   = "https://www.workbuddy.ai"
+	originCN     = "https://www.codebuddy.cn"
+	originGlobal = "https://www.workbuddy.ai"
+
+	pathAuthState    = "/v2/plugin/auth/state?platform=CLI"
+	pathLoginAcct    = "/v2/plugin/login/account?state="
+	pathAuthToken    = "/v2/plugin/auth/token?state="
+	pathTokenRefresh = "/v2/plugin/auth/token/refresh"
+	pathChat         = "/v2/chat/completions"
 
 	loginTTL = 5 * time.Minute
 )
+
+// normalizeRegion folds anything unrecognised onto the CN realm so a missing or
+// typo'd value keeps behaving like the deployment this plugin shipped for.
+func normalizeRegion(region string) string {
+	if strings.EqualFold(strings.TrimSpace(region), regionGlobal) {
+		return regionGlobal
+	}
+	return regionCN
+}
+
+func baseFor(region string) string {
+	if normalizeRegion(region) == regionGlobal {
+		return baseGlobal
+	}
+	return baseCN
+}
+
+func originFor(region string) string {
+	if normalizeRegion(region) == regionGlobal {
+		return originGlobal
+	}
+	return originCN
+}
+
+// pluginConfig mirrors the optional `plugins.configs.workbuddy` YAML block.
+type pluginConfig struct {
+	// Region selects which realm a new login targets: "cn" (default) or
+	// "global". It only decides the host used for OAuth; each account then
+	// remembers its own realm inside its credential file.
+	Region string `yaml:"region"`
+}
+
+var (
+	cfgMu     sync.Mutex
+	cfgRegion = regionCN
+)
+
+// applyConfigYAML reads the host-supplied config block from a plugin.register /
+// plugin.reconfigure request. Unknown or missing config is ignored so the
+// plugin keeps working with an empty config.
+func applyConfigYAML(raw []byte) {
+	var envelope struct {
+		ConfigYAML []byte `json:"config_yaml"`
+	}
+	if json.Unmarshal(raw, &envelope) != nil || len(envelope.ConfigYAML) == 0 {
+		return
+	}
+	var cfg pluginConfig
+	if yaml.Unmarshal(envelope.ConfigYAML, &cfg) != nil {
+		return
+	}
+	cfgMu.Lock()
+	cfgRegion = normalizeRegion(cfg.Region)
+	cfgMu.Unlock()
+}
+
+func configuredRegion() string {
+	cfgMu.Lock()
+	defer cfgMu.Unlock()
+	return cfgRegion
+}
 
 // loginCtx holds the cookie-affined HTTP client for one in-flight login flow.
 // CodeBuddy associates the browser login with the state issued at auth/state,
 // so we must reuse the same cookie jar across the state request and the polls.
 type loginCtx struct {
 	client  *http.Client
+	region  string
 	expires time.Time
 }
 
@@ -192,6 +267,16 @@ func hostCall(method string, request []byte) ([]byte, error) {
 	return out, nil
 }
 
+// hostLog forwards a diagnostic line to the host logger so discovery problems
+// show up in the CPA log instead of failing silently inside the plugin.
+func hostLog(level, message string, fields map[string]any) {
+	if hostAPI == nil || hostAPI.call == nil {
+		return
+	}
+	body, _ := json.Marshal(map[string]any{"level": level, "message": message, "fields": fields})
+	_, _ = hostCall(pluginabi.MethodHostLog, body)
+}
+
 // streamEmit pushes one chunk payload to the host stream. Returns an error if
 // the host rejected it (e.g. the client already disconnected and the stream
 // was closed), which the pump uses to stop reading a dead upstream.
@@ -227,9 +312,24 @@ func streamClose(streamID string) {
 func handleMethod(method string, request []byte) ([]byte, error) {
 	switch method {
 	case pluginabi.MethodPluginRegister, pluginabi.MethodPluginReconfigure:
+		applyConfigYAML(request)
 		return okEnvelope(wbRegistration())
-	case pluginabi.MethodModelStatic, pluginabi.MethodModelForAuth:
-		return okEnvelope(pluginapi.ModelResponse{Provider: providerName, Models: wbModels()})
+	case pluginabi.MethodPluginQuiesce:
+		// The host asks the plugin to stop taking on new work before a hot
+		// reload or shutdown. There is nothing to drain here, so acknowledge
+		// it: falling through to unknown_method would make the host log an
+		// error on every config reload.
+		return okEnvelope(struct{}{})
+	case pluginabi.MethodModelStatic:
+		// The catalog lives behind a credential, so model.for_auth is the only
+		// authoritative source. Advertising a bundled list here would publish
+		// models that no credential can actually serve, and clients calling
+		// them get "no auth available" instead of a clear "unknown model".
+		// fallbackModels() is still used by model.for_auth when the catalog
+		// cannot be fetched, so offline behaviour is unchanged.
+		return okEnvelope(pluginapi.ModelResponse{Provider: providerName})
+	case pluginabi.MethodModelForAuth:
+		return handleModelsForAuth(request)
 	case pluginabi.MethodAuthIdentifier:
 		return okEnvelope(identifierResponse{Identifier: providerName})
 	case pluginabi.MethodAuthParse:
@@ -310,39 +410,22 @@ func wbRegistration() registration {
 	}
 }
 
-func wbModels() []pluginapi.ModelInfo {
-	const maxCompletionTokens int64 = 8192
-	specs := []struct {
-		id            string
-		name          string
-		contextLength int64
-	}{
-		{"glm-5.2", "GLM-5.2", 1000000},
-		{"glm-5.1", "GLM-5.1", 131072},
-		{"glm-5v-turbo", "GLM-5V Turbo", 131072},
-		{"kimi-k2.7", "Kimi K2.7", 262144},
-		{"minimax-m3-pay", "MiniMax M3", 204800},
-		{"hy3", "Hy3", 262144},
-		{"hy3-preview", "Hy3 Preview", 262144},
-		{"hy3-preview-agent", "Hy3 Preview Agent", 262144},
-		{"deepseek-v4-pro", "DeepSeek V4 Pro", 1000000},
-		{"deepseek-v4-flash", "DeepSeek V4 Flash", 1000000},
+// handleModelsForAuth resolves the live per-account catalog. A broken or
+// unrecognised credential must not take the provider down, so it degrades to
+// the bundled fallback list instead of erroring out.
+func handleModelsForAuth(raw []byte) ([]byte, error) {
+	var req pluginapi.AuthModelRequest
+	if err := json.Unmarshal(raw, &req); err != nil {
+		return nil, err
 	}
-	models := make([]pluginapi.ModelInfo, 0, len(specs))
-	for _, m := range specs {
-		models = append(models, pluginapi.ModelInfo{
-			ID:                         m.id,
-			Object:                     "model",
-			OwnedBy:                    providerName,
-			DisplayName:                m.name,
-			Name:                       m.id,
-			SupportedGenerationMethods: []string{"chat"},
-			ContextLength:              m.contextLength,
-			MaxCompletionTokens:        maxCompletionTokens,
-			UserDefined:                true,
+	sa, err := parseStored(req.StorageJSON)
+	if err != nil {
+		hostLog("warn", "workbuddy: model.for_auth could not read stored credential", map[string]any{
+			"error": err.Error(),
 		})
+		return okEnvelope(pluginapi.ModelResponse{Provider: providerName, Models: fallbackModels()})
 	}
-	return models
+	return okEnvelope(pluginapi.ModelResponse{Provider: providerName, Models: modelsForAuth(req, sa)})
 }
 
 // -----------------------------------------------------------------------------
@@ -351,8 +434,48 @@ func wbModels() []pluginapi.ModelInfo {
 
 // storedAuth is the on-disk shape of a workbuddy credential.
 type storedAuth struct {
+	// Region records which realm issued this credential ("cn" or "global").
+	// Absent means CN, which keeps files written by older builds working.
+	Region  string        `json:"region,omitempty"`
 	Auth    storedTokens  `json:"auth"`
 	Account storedAccount `json:"account"`
+}
+
+// accountIdentity returns a stable, filesystem-safe identity for an account.
+// It drives both the auth file name and the auth ID, so two accounts can never
+// collide and overwrite each other. UID is preferred; without one (a partially
+// populated credential) we fall back to a short hash of the access token, which
+// is still stable for that account.
+func accountIdentity(sa *storedAuth) string {
+	if uid := strings.TrimSpace(sa.Account.UID); uid != "" {
+		return sanitizeIdentity(uid)
+	}
+	if token := strings.TrimSpace(sa.Auth.AccessToken); token != "" {
+		sum := sha256.Sum256([]byte(token))
+		return hex.EncodeToString(sum[:])[:12]
+	}
+	return "default"
+}
+
+// sanitizeIdentity keeps an identity safe to use as a file name component.
+func sanitizeIdentity(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+			b.WriteRune(r)
+		default:
+			b.WriteRune('-')
+		}
+	}
+	out := strings.Trim(b.String(), "-")
+	if out == "" {
+		return "default"
+	}
+	if len(out) > 64 {
+		out = out[:64]
+	}
+	return out
 }
 
 type storedTokens struct {
@@ -439,19 +562,20 @@ func newLoginClient() *http.Client {
 	}
 }
 
-func commonHeaders(req *http.Request) {
+func commonHeaders(req *http.Request, region string) {
+	origin := originFor(region)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
-	req.Header.Set("Origin", originReferer)
-	req.Header.Set("Referer", originReferer+"/")
+	req.Header.Set("Origin", origin)
+	req.Header.Set("Referer", origin+"/")
 	req.Header.Set("User-Agent", clientUA)
 }
 
 // backendHeaders applies auth-derived headers to a chat completion request.
 // Empty fields are signalled via the X-No-* convention used by CodeBuddy.
 func backendHeaders(req *http.Request, sa *storedAuth) {
-	commonHeaders(req)
+	commonHeaders(req, sa.Region)
 	if sa.Auth.AccessToken != "" {
 		req.Header.Set("Authorization", "Bearer "+sa.Auth.AccessToken)
 	} else {
@@ -488,7 +612,7 @@ func doJSON(client *http.Client, method, fullURL string, headers func(*http.Requ
 	if headers != nil {
 		headers(req)
 	} else {
-		commonHeaders(req)
+		commonHeaders(req, regionCN)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -531,34 +655,117 @@ func handleParseAuth(raw []byte) ([]byte, error) {
 
 func toAuthData(sa *storedAuth) pluginapi.AuthData {
 	storage, _ := json.Marshal(sa)
+	identity := accountIdentity(sa)
+	label := "WorkBuddy"
+	if nickname := strings.TrimSpace(sa.Account.Nickname); nickname != "" {
+		label = "WorkBuddy (" + nickname + ")"
+	} else if identity != "default" {
+		label = "WorkBuddy (" + identity + ")"
+	}
+	if normalizeRegion(sa.Region) == regionGlobal {
+		label += " · Global"
+	}
 	return pluginapi.AuthData{
-		Provider:    providerName,
-		ID:          providerName,
-		FileName:    authFileName,
-		Label:       "WorkBuddy",
+		Provider: providerName,
+		// Per-account ID and file name: this is what lets several CodeBuddy
+		// accounts (CN and Global alike) live side by side in the auth store.
+		ID:          providerName + "-" + identity,
+		FileName:    providerName + "-" + identity + ".json",
+		Label:       label,
 		StorageJSON: storage,
-		Metadata:    map[string]any{"type": providerName},
+		Metadata:    map[string]any{"type": providerName, "region": normalizeRegion(sa.Region)},
 	}
 }
 
-func handleStartLogin(raw []byte) ([]byte, error) {
+// otherRegion returns the realm that is not the one given.
+func otherRegion(region string) string {
+	if normalizeRegion(region) == regionGlobal {
+		return regionCN
+	}
+	return regionGlobal
+}
+
+// startLoginFor issues an auth state against one realm and remembers the
+// pending login, tagged with its realm so the poll can finish on the same host.
+func startLoginFor(region string) (*authStateData, error) {
 	client := newLoginClient()
-	data, _, err := doJSON(client, http.MethodPost, endpointAuthState, nil, bytes.NewReader([]byte("{}")))
+	headers := func(r *http.Request) { commonHeaders(r, region) }
+	data, _, err := doJSON(client, http.MethodPost, baseFor(region)+pathAuthState, headers, bytes.NewReader([]byte("{}")))
 	if err != nil {
-		return nil, fmt.Errorf("auth state failed: %w", err)
+		return nil, err
 	}
 	var st authStateData
-	_ = json.Unmarshal(data, &st)
-	if st.State == "" || st.AuthURL == "" {
-		return nil, fmt.Errorf("auth state: missing state or authUrl")
+	if err := json.Unmarshal(data, &st); err != nil {
+		return nil, err
 	}
-	loginStates.Store(st.State, &loginCtx{client: client, expires: time.Now().Add(loginTTL)})
+	if st.State == "" || st.AuthURL == "" {
+		return nil, fmt.Errorf("missing state or authUrl")
+	}
+	loginStates.Store(st.State, &loginCtx{client: client, region: region, expires: time.Now().Add(loginTTL)})
+	return &st, nil
+}
+
+// handleStartLogin opens a login against both realms so one "login" click can
+// produce a CodeBuddy CN URL *and* a WorkBuddy Global URL. The host gives the
+// plugin no per-login input (it passes only provider and base URL), so the
+// realm cannot be chosen from the request; the primary URL follows the `region`
+// config and the other one is published in the response metadata and the host
+// log. Whichever URL the user completes determines the account's realm.
+func handleStartLogin(raw []byte) ([]byte, error) {
+	primary := configuredRegion()
+	var req pluginapi.AuthLoginStartRequest
+	if json.Unmarshal(raw, &req) == nil {
+		if hint, ok := req.Metadata["region"].(string); ok && strings.TrimSpace(hint) != "" {
+			primary = normalizeRegion(hint)
+		}
+	}
+	secondary := otherRegion(primary)
+
+	primaryState, errPrimary := startLoginFor(primary)
+	if errPrimary != nil {
+		return nil, fmt.Errorf("auth state failed (%s): %w", primary, errPrimary)
+	}
+
+	// Best effort only: workbuddy.ai is often unreachable from mainland
+	// networks, and that must not break a CN login (and vice versa).
+	secondaryState, errSecondary := startLoginFor(secondary)
+
+	meta := map[string]any{
+		"region":           primary,
+		primary + "_url":   primaryState.AuthURL,
+		primary + "_state": primaryState.State,
+		"secondary_region": secondary,
+	}
+	if errSecondary == nil {
+		meta[secondary+"_url"] = secondaryState.AuthURL
+		meta[secondary+"_state"] = secondaryState.State
+	} else {
+		meta["secondary_error"] = errSecondary.Error()
+	}
+
+	// Log both URLs: the host UI only renders the primary one, so this is the
+	// discoverable place to grab the other realm's login link.
+	hostLog("info", "workbuddy: OAuth login started", map[string]any{
+		"primary_region":   primary,
+		"primary_url":      primaryState.AuthURL,
+		"secondary_region": secondary,
+		"secondary_url":    urlOrError(secondaryState, errSecondary),
+	})
+
 	return okEnvelope(pluginapi.AuthLoginStartResponse{
 		Provider:  providerName,
-		URL:       st.AuthURL,
-		State:     st.State,
+		URL:       primaryState.AuthURL,
+		State:     primaryState.State,
 		ExpiresAt: time.Now().Add(loginTTL).UTC(),
+		Metadata:  meta,
 	})
+}
+
+func urlOrError(st *authStateData, err error) string {
+	if err != nil {
+		return "unavailable: " + err.Error()
+	}
+	return st.AuthURL
 }
 
 func handlePollLogin(raw []byte) ([]byte, error) {
@@ -586,7 +793,9 @@ func handlePollLogin(raw []byte) ([]byte, error) {
 	// token bundle once complete. login/account sits behind the openresty gateway
 	// and is rejected (401) until login finishes, so probe token first and only
 	// fetch account once we hold a bearer.
-	tokRaw, _, errTok := doJSON(lc.client, http.MethodGet, endpointAuthToken+state, nil, nil)
+	base := baseFor(lc.region)
+	tokHeaders := func(r *http.Request) { commonHeaders(r, lc.region) }
+	tokRaw, _, errTok := doJSON(lc.client, http.MethodGet, base+pathAuthToken+state, tokHeaders, nil)
 	if errTok != nil {
 		return okEnvelope(pluginapi.AuthLoginPollResponse{
 			Status:  pluginapi.AuthLoginStatusPending,
@@ -603,14 +812,15 @@ func handlePollLogin(raw []byte) ([]byte, error) {
 
 	var acct accountData
 	acctHeaders := func(r *http.Request) {
-		commonHeaders(r)
+		commonHeaders(r, lc.region)
 		r.Header.Set("Authorization", "Bearer "+tok.AccessToken)
 	}
-	if acctRaw, _, errAcct := doJSON(lc.client, http.MethodGet, endpointLoginAcct+state, acctHeaders, nil); errAcct == nil {
+	if acctRaw, _, errAcct := doJSON(lc.client, http.MethodGet, base+pathLoginAcct+state, acctHeaders, nil); errAcct == nil {
 		_ = json.Unmarshal(acctRaw, &acct)
 	}
 
 	sa := &storedAuth{
+		Region: lc.region,
 		Auth: storedTokens{
 			AccessToken:  tok.AccessToken,
 			RefreshToken: tok.RefreshToken,
@@ -640,14 +850,14 @@ func handleRefreshAuth(raw []byte) ([]byte, error) {
 		return nil, fmt.Errorf("refresh: %w", err)
 	}
 	headers := func(r *http.Request) {
-		commonHeaders(r)
+		commonHeaders(r, sa.Region)
 		r.Header.Set("X-Refresh-Token", sa.Auth.RefreshToken)
 		if sa.Account.EnterpriseID != "" {
 			r.Header.Set("X-Enterprise-Id", sa.Account.EnterpriseID)
 		}
 		r.Header.Set("X-Auth-Refresh-Source", providerName)
 	}
-	data, status, err := doJSON(sharedHTTPClient(), http.MethodPost, endpointTokenRefresh, headers, nil)
+	data, status, err := doJSON(sharedHTTPClient(), http.MethodPost, baseFor(sa.Region)+pathTokenRefresh, headers, nil)
 	if err != nil {
 		if status >= 400 {
 			return nil, fmt.Errorf("refresh rejected (HTTP %d)", status)
@@ -684,8 +894,8 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 	}
 	// CodeBuddy rejects non-stream requests (code 11101), so always stream
 	// upstream and fold the chunks into a single chat.completion object.
-	body := rewriteSystemForUpstream(forceStreamBody(req.Payload, req.OriginalRequest))
-	httpReq, err := http.NewRequest(http.MethodPost, endpointChat, bytes.NewReader(body))
+	body := ensureSystemFirst(rewriteSystemForUpstream(forceStreamBody(req.Payload, req.OriginalRequest)), sa.Region)
+	httpReq, err := http.NewRequest(http.MethodPost, baseFor(sa.Region)+pathChat, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -727,7 +937,7 @@ func handleExecStream(raw []byte) ([]byte, error) {
 	if len(body) == 0 {
 		body = req.OriginalRequest
 	}
-	body = rewriteSystemForUpstream(body)
+	body = ensureSystemFirst(rewriteSystemForUpstream(body), sa.Region)
 
 	headers := streamHeaders()
 	sseFramed := clientNeedsSSEFrame(req.Metadata)
@@ -743,7 +953,7 @@ func handleExecStream(raw []byte) ([]byte, error) {
 
 	// Async: return immediately with empty chunks. A goroutine pumps the upstream
 	// and emits each chunk via host.stream.emit so the client sees true streaming.
-	httpReq, err := http.NewRequest(http.MethodPost, endpointChat, bytes.NewReader(body))
+	httpReq, err := http.NewRequest(http.MethodPost, baseFor(sa.Region)+pathChat, bytes.NewReader(body))
 	if err != nil {
 		streamEmitError(req.StreamID, err.Error())
 		streamClose(req.StreamID)
@@ -804,7 +1014,7 @@ func pumpUpstreamStream(httpReq *http.Request, streamID string, sseFramed bool) 
 // collectUpstreamStream is the synchronous fallback (no async stream id): drain
 // the upstream, clean each chunk, return them as a slice.
 func collectUpstreamStream(body []byte, sa *storedAuth, sseFramed bool) ([]pluginapi.ExecutorStreamChunk, error) {
-	httpReq, err := http.NewRequest(http.MethodPost, endpointChat, bytes.NewReader(body))
+	httpReq, err := http.NewRequest(http.MethodPost, baseFor(sa.Region)+pathChat, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -957,6 +1167,37 @@ func rewriteSystemForUpstream(payload []byte) []byte {
 	if !changed {
 		return payload
 	}
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return payload
+	}
+	return out
+}
+
+// ensureSystemFirst opens the conversation with a system message when it does
+// not already have one. The Global realm rejects any payload whose first
+// message is not a system prompt (code 11128, "first message is not system
+// prompt"); CN accepts them, so this is scoped to Global to keep CN traffic
+// byte-identical. An empty system message is enough to satisfy the check and
+// does not influence the model.
+func ensureSystemFirst(payload []byte, region string) []byte {
+	if normalizeRegion(region) != regionGlobal || len(payload) == 0 {
+		return payload
+	}
+	var obj map[string]any
+	if json.Unmarshal(payload, &obj) != nil {
+		return payload
+	}
+	messages, ok := obj["messages"].([]any)
+	if !ok || len(messages) == 0 {
+		return payload
+	}
+	if first, ok := messages[0].(map[string]any); ok {
+		if role, _ := first["role"].(string); strings.EqualFold(role, "system") {
+			return payload
+		}
+	}
+	obj["messages"] = append([]any{map[string]any{"role": "system", "content": ""}}, messages...)
 	out, err := json.Marshal(obj)
 	if err != nil {
 		return payload

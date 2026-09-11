@@ -6,13 +6,100 @@
 
 ## 工作原理
 
-在 CPA 里注册为 `workbuddy` provider:负责 CodeBuddy 扫码登录、token 刷新,并把请求转发到 `copilot.tencent.com/v2/chat/completions`。登录后凭据存为 `workbuddy.json`。
+在 CPA 里注册为 `workbuddy` provider:负责 CodeBuddy 扫码登录、token 刷新,并把请求转发到
+`copilot.tencent.com/v2/chat/completions`(国际版是 `www.workbuddy.ai`,路径完全相同)。
+
+## 多账号
+
+每个账号一份凭据文件 `workbuddy-<identity>.json`,`<identity>` 取账号 uid(拿不到时退化为
+access token 的短哈希)。国内号和国际号可以并存,互不覆盖。
+
+> 以前 `FileName` / `ID` 固定是 `workbuddy.json` / `workbuddy`,而 CPA 正是按 `FileName`
+> 落盘的,所以第二个账号会直接覆盖第一个 —— 这就是"只能上传一个认证文件"的原因。
+>
+> **升级注意**:旧的 `workbuddy.json` 仍能被解析,但建议删掉后重新登录,避免和新的
+> `workbuddy-<uid>.json` 重复。
+
+## 国际版(Global)
+
+国际版 `www.workbuddy.ai` 与国内版 `copilot.tencent.com` **接口路径完全一致**,只有域名不同
+(已实测:`/v2/plugin/auth/state`、`/v2/chat/completions`、`/v3/config`、
+`/console/enterprises/personal/models` 两边行为一致),所以支持国际版只是换个 base URL。
+
+**但请求约束两边不一样,这是踩过的坑:**
+
+| | 国内版 | 国际版 |
+| --- | --- | --- |
+| 非流式 `/v2/chat/completions` | 拒绝(code 11101) | 拒绝(code 11101) |
+| 首条消息必须是 system | 不要求 | **要求**(否则 code 11128) |
+
+非流式两个区都拒绝,插件统一改成向上游流式再聚合成一个 `chat.completion`
+(`forceStreamBody`),这个早就处理了。首条消息必须是 system 只有国际版要求,由
+`ensureSystemFirst` 处理:仅在 `region: global` 时补一条**空内容**的 system 消息
+(实测空 system 就能通过校验,且不干扰模型输出)。国内版请求保持逐字节不变。
+
+### 登录时怎么选区
+
+宿主调 `auth.login.start` 时只给插件 `provider` 和 `baseURL`,**不传任何自定义入参**
+(`Metadata` 永远是空的),而一个插件又只能注册一个 provider id —— 所以没法在界面上选区。
+
+绕过的办法:**一次"登录"同时向两个区各申请一个 login state**。
+
+- 返回的 `URL` 是**主区**的,主区由 `region` 配置决定(默认 `cn`)。
+- 另一个区的 URL 放在返回值的 `metadata` 里(`cn_url` / `global_url`,附对应 `state`),
+  同时**两个 URL 都会打到 CPA 日志**。
+- 两个 state 都挂着,**你扫哪个码,建档就是哪个区** —— 不用改配置、不用重启。
+
+```yaml
+plugins:
+  enabled: true
+  dir: "plugins"
+  configs:
+    workbuddy:
+      enabled: true
+      priority: 100
+      region: cn          # 只决定主 URL 是哪个区,cn(默认) | global
+```
+
+次要区是 best-effort:国际版在国内网络经常连不通,失败时只记一条日志,**不影响主区登录**。
+
+区域会写进每个账号的凭据文件(`"region":"global"`),之后该账号的刷新、模型发现、聊天请求
+都固定走它自己的区。老凭据文件没有 `region` 字段,按 `cn` 处理,向后兼容。
 
 ## 模型
 
-`glm-5.2` · `glm-5.1` · `glm-5v-turbo` · `kimi-k2.7` · `minimax-m3-pay` · `hy3` · `hy3-preview` · `hy3-preview-agent` · `deepseek-v4-pro` · `deepseek-v4-flash`
+登录后按账号**动态发现**，不再硬编码:
 
-具体可用性以 CodeBuddy 账号权限为准。
+1. `GET https://copilot.tencent.com/v3/config` —— 每个 CodeBuddy 客户端启动时拉的远程配置,
+   `data.models` 就是该账号有权使用的模型目录(带 `maxInputTokens` / `maxOutputTokens` /
+   `supportsImages` 等 serving 字段)。
+2. 拿不到时退回旧接口 `GET /console/enterprises/personal/models`。
+3. 都失败(网络不通 / token 失效 / 上游改结构)才用内置兜底列表:
+   `default-model` · `auto-chat` · `glm-5v-turbo` · `kimi-k2.5` · `deepseek-v3.2` ·
+   `gpt-5.5` · `gemini-3.5-flash`
+
+结果按账号缓存 30 分钟。发现失败会走 `host.log` 打一条 `warn`,在 CPA 日志里能看到原因。
+
+已用真实账号验证:带 Bearer 时 `/v3/config` 确实返回 `data.models`(实测每账号 29 个),字段同
+`{id, name, vendor, descriptionZh/En, maxInputTokens, maxOutputTokens, supportsImages,
+supportsToolCall, supportsReasoning, onlyReasoning, credits, ...}`。
+
+目录里的内部模型会自动过滤掉:`completion-*` / `nes-*` / `enhance-*`(补全、next-edit
+suggestion、提示词增强,不能走 chat completions)。
+
+两个约束:
+
+- `model.static` 返回空列表。模型目录在凭据后面,没有凭据就没有可用模型;如果这里再吐一份
+  内置列表,`/v1/models` 会列出没有任何凭据能服务的模型,客户端一调用就得到
+  `auth_not_found: no auth available`。所以目录只由 `model.for_auth` 提供,内置列表保留为
+  `model.for_auth` 拉取失败时的兜底(此时它挂在该凭据下,是可路由的)。
+- 上游给的字段缺失时才用默认值(上下文 200000、输出 8192)。
+
+> **注意**:旧的硬编码列表(`hy3` / `hy3-preview` / `hy3-preview-agent` / `glm-5.2` /
+> `glm-5.1` / `kimi-k2.7` / `minimax-m3-pay` / `deepseek-v4-*`)在当前目录里已全部不存在,
+> 实测目录是 `default-model` / `auto-chat` / `glm-5v-turbo` / `kimi-k2.5` / `deepseek-v3.2` /
+> `gpt-5.x` / `gemini-3.x` 这一批。兜底列表和 README 已同步更新。因此下面「思考模式」一节
+> 里关于 hy3 的描述目前是死代码(账号若仍有 hy3 权限则照常生效)。
 
 ## 安装
 
