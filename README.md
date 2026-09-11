@@ -125,6 +125,34 @@ suggestion、提示词增强,不能走 chat completions)。
   `model.for_auth` 拉取失败时的兜底(此时它挂在该凭据下,是可路由的)。
 - 上游给的字段缺失时才用默认值(上下文 200000、输出 8192)。
 
+### 上游目录不全时:`extra_models`
+
+`/v3/config` 并不总是完整。**国际版实测会漏掉整个 hy4 系列** —— 拿 OAuth token 直接调
+`https://www.workbuddy.ai/v2/chat/completions`,`hy4-preview` / `hy4-preview-f` /
+`hy4-preview-x` 全都返回 200(能用),但 `/v3/config` 里只有 `hy3`。而控制台那个
+`/console/enterprises/personal/models` 确实列了它们,**但它只认浏览器 session cookie**,
+带 Bearer 打过去在国际版是 500(国内版这个接口带 Bearer 是能通的),插件拿不到 cookie。
+
+所以补一个显式配置项,避免把 id 硬编码进二进制:
+
+```yaml
+    workbuddy-global:
+      enabled: true
+      priority: 100
+      region: global
+      extra_models:
+        - hy4-preview
+        - hy4-preview-f
+        - hy4-preview-x
+```
+
+规则:已在上游目录里的 id 不会重复添加(保留上游的真实元数据);`completion-` / `nes-` /
+`enhance-` 这些内部模型配了也会被忽略。
+
+顺带一个观察到的现象:**同一个 OAuth token 打国内域名 `copilot.tencent.com/v3/config` 也能
+通**,而且返回 29 个模型、含 hy4 —— 但这个列表是按国内目录给的,里面有些 id(比如
+`hy3-x`)在国际版上调不通(`11102 service info not found`),所以不能直接拿来当国际版目录用。
+
 > **注意**:旧的硬编码列表(`hy3` / `hy3-preview` / `hy3-preview-agent` / `glm-5.2` /
 > `glm-5.1` / `kimi-k2.7` / `minimax-m3-pay` / `deepseek-v4-*`)在当前目录里已全部不存在,
 > 实测目录是 `default-model` / `auto-chat` / `glm-5v-turbo` / `kimi-k2.5` / `deepseek-v3.2` /

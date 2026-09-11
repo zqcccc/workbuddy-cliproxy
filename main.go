@@ -140,11 +140,19 @@ type pluginConfig struct {
 	// "global". It only decides the host used for OAuth; each account then
 	// remembers its own realm inside its credential file.
 	Region string `yaml:"region"`
+	// ExtraModels lists model ids this realm serves but does not advertise in
+	// its own catalog. The Global realm's /v3/config omits the hy4 family even
+	// though chat completions accept it, and the endpoint that does list them
+	// (/console/enterprises/personal/models) only authenticates with a browser
+	// session cookie, which a plugin does not have. Listing them here is the
+	// only way to expose them without hardcoding ids in the binary.
+	ExtraModels []string `yaml:"extra_models"`
 }
 
 var (
-	cfgMu     sync.Mutex
-	cfgRegion = buildRegion
+	cfgMu          sync.Mutex
+	cfgRegion      = buildRegion
+	cfgExtraModels []string
 )
 
 // applyConfigYAML reads the host-supplied config block from a plugin.register /
@@ -161,21 +169,29 @@ func applyConfigYAML(raw []byte) {
 	if yaml.Unmarshal(envelope.ConfigYAML, &cfg) != nil {
 		return
 	}
+	cfgMu.Lock()
+	defer cfgMu.Unlock()
 	// An absent region must not clobber the realm this binary was built for,
 	// otherwise a workbuddy-global.so would silently fall back to CN whenever
 	// its config block omits the key.
-	if strings.TrimSpace(cfg.Region) == "" {
-		return
+	if strings.TrimSpace(cfg.Region) != "" {
+		cfgRegion = normalizeRegion(cfg.Region)
 	}
-	cfgMu.Lock()
-	cfgRegion = normalizeRegion(cfg.Region)
-	cfgMu.Unlock()
+	cfgExtraModels = cfg.ExtraModels
 }
 
 func configuredRegion() string {
 	cfgMu.Lock()
 	defer cfgMu.Unlock()
 	return cfgRegion
+}
+
+// configuredExtraModels returns operator-supplied model ids that upstream does
+// not advertise but does serve.
+func configuredExtraModels() []string {
+	cfgMu.Lock()
+	defer cfgMu.Unlock()
+	return cfgExtraModels
 }
 
 // loginCtx holds the cookie-affined HTTP client for one in-flight login flow.

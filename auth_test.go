@@ -5,6 +5,8 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
 func TestAccountIdentity(t *testing.T) {
@@ -277,5 +279,45 @@ func TestProviderNameIsValidPluginID(t *testing.T) {
 	case regionCN, regionGlobal:
 	default:
 		t.Fatalf("buildRegion = %q, want cn or global", buildRegion)
+	}
+}
+
+func setConfiguredExtraModelsForTest(v []string) {
+	cfgMu.Lock()
+	defer cfgMu.Unlock()
+	cfgExtraModels = v
+}
+
+func TestAppendExtraModels(t *testing.T) {
+	restore := configuredExtraModels()
+	t.Cleanup(func() { setConfiguredExtraModelsForTest(restore) })
+
+	base := []pluginapi.ModelInfo{{ID: "hy3"}, {ID: "gpt-5.5"}}
+
+	// Nothing configured: the discovered list is returned untouched.
+	setConfiguredExtraModelsForTest(nil)
+	if got := appendExtraModels(base); len(got) != 2 {
+		t.Fatalf("len = %d, want 2", len(got))
+	}
+
+	// Configured ids are appended; ids already discovered are not duplicated.
+	setConfiguredExtraModelsForTest([]string{"hy4-preview-f", "hy4-preview-x", "hy3", "  "})
+	got := appendExtraModels(base)
+	if len(got) != 4 {
+		t.Fatalf("len = %d, want 4 (2 existing + 2 new)", len(got))
+	}
+	ids := map[string]bool{}
+	for _, m := range got {
+		ids[m.ID] = true
+	}
+	for _, want := range []string{"hy3", "gpt-5.5", "hy4-preview-f", "hy4-preview-x"} {
+		if !ids[want] {
+			t.Errorf("missing %q", want)
+		}
+	}
+	// Service models are never advertised, even when configured.
+	setConfiguredExtraModelsForTest([]string{"completion-1.0"})
+	if got := appendExtraModels(base); len(got) != 2 {
+		t.Fatalf("service model was added: %d", len(got))
 	}
 }

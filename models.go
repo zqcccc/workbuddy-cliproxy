@@ -342,13 +342,60 @@ func modelsForAuth(req pluginapi.AuthModelRequest, sa *storedAuth) []pluginapi.M
 		})
 		return fallbackModels()
 	}
-	models := toModelInfos(remote)
+	models := appendExtraModels(toModelInfos(remote))
 	modelCacheStore(key, models)
 	hostLog("info", "workbuddy: model discovery succeeded", map[string]any{
 		"uid":   sa.Account.UID,
 		"count": len(models),
 	})
 	return models
+}
+
+// appendExtraModels adds the ids configured under plugins.configs.<id>.
+// extra_models. Upstream catalogs are not always complete: the Global realm
+// serves the hy4 family but leaves it out of /v3/config, and the endpoint that
+// does list it is browser-session only. Entries already present upstream are
+// skipped so a discovered model keeps its real metadata instead of being
+// replaced by these defaults.
+func appendExtraModels(models []pluginapi.ModelInfo) []pluginapi.ModelInfo {
+	extra := configuredExtraModels()
+	if len(extra) == 0 {
+		return models
+	}
+	seen := make(map[string]struct{}, len(models))
+	for _, m := range models {
+		seen[m.ID] = struct{}{}
+	}
+	out := models
+	added := 0
+	for _, raw := range extra {
+		id := strings.TrimSpace(raw)
+		if id == "" || isServiceModel(id) {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, pluginapi.ModelInfo{
+			ID:                         id,
+			Object:                     "model",
+			OwnedBy:                    providerName,
+			DisplayName:                id,
+			Name:                       id,
+			SupportedGenerationMethods: []string{"chat"},
+			ContextLength:              defaultContextLength,
+			MaxCompletionTokens:        defaultMaxCompletion,
+			SupportedInputModalities:   []string{"text"},
+			SupportedOutputModalities:  []string{"text"},
+			UserDefined:                true,
+		})
+		added++
+	}
+	if added > 0 {
+		hostLog("info", "workbuddy: added configured extra models", map[string]any{"count": added})
+	}
+	return out
 }
 
 // fallbackModels is the bundled catalog used for model.static (no credentials
