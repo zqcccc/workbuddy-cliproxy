@@ -196,6 +196,31 @@ suggestion、提示词增强,不能走 chat completions)。
 > `gpt-5.x` / `gemini-3.x` 这一批。兜底列表和 README 已同步更新。因此下面「思考模式」一节
 > 里关于 hy3 的描述目前是死代码(账号若仍有 hy3 权限则照常生效)。
 
+## 额度(剩余积分)
+
+插件带一个 Management API 扩展,装好并重启后 CPA 面板左侧会出现 **额度** 菜单,
+直接列出每个 workbuddy 账号还剩多少 credits、每个资源包的剩余/总量与周期截止时间。
+
+- 页面地址:`/v0/resource/plugins/<pluginID>/quota`,例如
+  `http://<host>:8317/v0/resource/plugins/workbuddy/quota`
+- 需要原始数据时用鉴权路由:`/v0/management/workbuddy/quota`(返回 JSON,
+  账号名/uid 不脱敏)。加 `?refresh=1` 可跳过 60 秒缓存强制重查。
+
+页面数据来自上游 `POST /v2/billing/meter/get-user-resource`,由插件用
+`host.auth.list` / `host.auth.get` 取回**自己名下**的凭据后逐个查询。三个要点:
+
+1. **额度是账户级积分池,不是每个模型一份。** 模型只有消耗倍率
+   (`GET /v3/config` → `models[].credits`,如 `x0.00` ~ `x5.00`),`x0.00` 表示不扣积分
+   (如 `hy3`、试用中的 `hy4-preview-f`)。单次实际扣费在 chat 响应的 `usage.credit`。
+2. **该接口有两个坑**:只接受 POST(GET 一律 404);必须带
+   `User-Agent: CLI/<ver> CodeBuddy/<ver>`,否则返回 403 `code 10085`(看着像权限问题,
+   其实只是 UA 校验)。插件已经在 `commonHeaders()` 里处理。
+3. **面板查询不会刷新 token。** 上游 refresh 会轮换 refresh token,而这条路径不写回
+   凭据,轮换后旧 token 就废了。所以过期账号只提示"请重新登录",不会自己去刷。
+
+资源路由按 CPA 的设计**不走管理鉴权**,因此页面上的账号名与 uid 做了脱敏
+(`知***` / `98e520f0…`)。要完整信息请用上面的 `/v0/management/...` JSON 路由。
+
 ## 安装
 
 **前置**:运行中的 CLIProxyAPI v7.2.x(带 CGO / 插件支持)、CodeBuddy 账号、Go 1.26+ 与 gcc;编译架构需与 CPA 实例一致(amd64 / arm64)。
