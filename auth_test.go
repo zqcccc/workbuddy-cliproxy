@@ -321,3 +321,82 @@ func TestAppendExtraModels(t *testing.T) {
 		t.Fatalf("service model was added: %d", len(got))
 	}
 }
+
+func TestConfiguredModelPrefix(t *testing.T) {
+	restoreRegion := configuredRegion()
+	restorePrefix := configuredModelPrefix()
+	t.Cleanup(func() {
+		setConfiguredRegionForTest(restoreRegion)
+		cfgMu.Lock()
+		cfgModelPrefix = restorePrefix
+		cfgMu.Unlock()
+	})
+
+	body, err := json.Marshal(map[string]any{
+		"config_yaml": []byte("region: global\nmodel_prefix: global\nextra_models:\n  - hy4-preview-x\n"),
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	applyConfigYAML(body)
+	if got := configuredModelPrefix(); got != "global" {
+		t.Fatalf("configuredModelPrefix = %q, want global", got)
+	}
+	if got := configuredRegion(); got != regionGlobal {
+		t.Fatalf("configuredRegion = %q, want global", got)
+	}
+
+	// The prefix reaches the auth record, which is what makes the host expose
+	// "<prefix>/<model>" and strip it again before routing.
+	sa := &storedAuth{Region: regionGlobal, Auth: storedTokens{AccessToken: "a", RefreshToken: "r"},
+		Account: storedAccount{UID: "uid-one", Nickname: "One"}}
+	if got := toAuthData(sa).Prefix; got != "global" {
+		t.Fatalf("toAuthData().Prefix = %q, want global", got)
+	}
+
+	// Unset by default so CN instances keep bare model ids.
+	cfgMu.Lock()
+	cfgModelPrefix = ""
+	cfgMu.Unlock()
+	if got := toAuthData(sa).Prefix; got != "" {
+		t.Fatalf("toAuthData().Prefix = %q, want empty", got)
+	}
+}
+
+func TestStripModelPrefixInBody(t *testing.T) {
+	restore := configuredModelPrefix()
+	t.Cleanup(func() {
+		cfgMu.Lock()
+		cfgModelPrefix = restore
+		cfgMu.Unlock()
+	})
+
+	body := []byte(`{"model":"global/hy3","messages":[]}`)
+
+	// With no prefix configured the payload is untouched.
+	cfgMu.Lock()
+	cfgModelPrefix = ""
+	cfgMu.Unlock()
+	if got := stripModelPrefixInBody(body); string(got) != string(body) {
+		t.Fatalf("rewrote without prefix: %s", got)
+	}
+
+	cfgMu.Lock()
+	cfgModelPrefix = "global"
+	cfgMu.Unlock()
+	var obj struct {
+		Model string `json:"model"`
+	}
+	if err := json.Unmarshal(stripModelPrefixInBody(body), &obj); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if obj.Model != "hy3" {
+		t.Fatalf("model = %q, want hy3", obj.Model)
+	}
+	// A bare id, a different prefix and junk all pass through unchanged.
+	for _, keep := range []string{`{"model":"hy3"}`, `{"model":"other/hy3"}`, `not json`, `{}`} {
+		if got := stripModelPrefixInBody([]byte(keep)); string(got) != keep {
+			t.Fatalf("%q became %q", keep, got)
+		}
+	}
+}

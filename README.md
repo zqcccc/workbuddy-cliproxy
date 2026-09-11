@@ -153,6 +153,29 @@ suggestion、提示词增强,不能走 chat completions)。
 通**,而且返回 29 个模型、含 hy4 —— 但这个列表是按国内目录给的,里面有些 id(比如
 `hy3-x`)在国际版上调不通(`11102 service info not found`),所以不能直接拿来当国际版目录用。
 
+### 给某个区的模型加命名空间:`model_prefix`
+
+国内/国际的目录有大量重名 id(`hy3`、`glm-5.x`、`kimi-k2.x`…),而 CPA **按 id 去重**,
+重名的只会保留一条、归给 priority 高的那个。想显式指定"走国际版",用 `model_prefix`:
+
+```yaml
+    workbuddy-global:
+      region: global
+      model_prefix: global    # 目录里会多出 global/<model>
+```
+
+宿主会把它展开成 `<prefix>/<model>`(`sdk/cliproxy/service_models.go` `applyModelPrefixes`,
+格式固定是 `前缀 + "/" + id`),选路时用 `rewriteModelForAuth` 把前缀剥掉再匹配 ——
+所以 `global/kimi-k2.5` 一定落在国际版凭据上,而裸 `kimi-k2.5` 仍然按 priority 走国内。
+两种名字会同时存在(除非在 CPA 全局开 `force-model-prefix`,那会影响所有 provider,不建议)。
+
+**注意宿主只剥前缀做"选路",不会改写转发给插件的请求体** —— 插件拿到的 `model` 还是
+`global/kimi-k2.5`。所以插件自己要在发出去之前剥掉(`stripModelPrefixInBody`),否则上游
+报 `11102 service info not found`。这一点是实测踩出来的。
+
+加了前缀后还会顺带解放一些被别的 provider 抢注的 id:`gpt-5.6-luna` / `gpt-5.6-terra`
+原本归 openai provider,现在能以 `global/gpt-5.6-luna` 走国际版。
+
 > **注意**:旧的硬编码列表(`hy3` / `hy3-preview` / `hy3-preview-agent` / `glm-5.2` /
 > `glm-5.1` / `kimi-k2.7` / `minimax-m3-pay` / `deepseek-v4-*`)在当前目录里已全部不存在,
 > 实测目录是 `default-model` / `auto-chat` / `glm-5v-turbo` / `kimi-k2.5` / `deepseek-v3.2` /

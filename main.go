@@ -147,12 +147,19 @@ type pluginConfig struct {
 	// session cookie, which a plugin does not have. Listing them here is the
 	// only way to expose them without hardcoding ids in the binary.
 	ExtraModels []string `yaml:"extra_models"`
+	// ModelPrefix namespaces this instance's models so a client can ask for one
+	// realm explicitly. The host turns it into "<prefix>/<model>" and strips it
+	// again before selecting an auth, so "global/kimi-k2.5" always resolves to
+	// a Global credential even when CN offers the same id. The bare id stays
+	// available unless force-model-prefix is set globally.
+	ModelPrefix string `yaml:"model_prefix"`
 }
 
 var (
 	cfgMu          sync.Mutex
 	cfgRegion      = buildRegion
 	cfgExtraModels []string
+	cfgModelPrefix string
 )
 
 // applyConfigYAML reads the host-supplied config block from a plugin.register /
@@ -178,6 +185,7 @@ func applyConfigYAML(raw []byte) {
 		cfgRegion = normalizeRegion(cfg.Region)
 	}
 	cfgExtraModels = cfg.ExtraModels
+	cfgModelPrefix = strings.TrimSpace(cfg.ModelPrefix)
 }
 
 func configuredRegion() string {
@@ -192,6 +200,14 @@ func configuredExtraModels() []string {
 	cfgMu.Lock()
 	defer cfgMu.Unlock()
 	return cfgExtraModels
+}
+
+// configuredModelPrefix returns the namespace prepended to this instance's
+// model ids, or "" when the operator left it unset.
+func configuredModelPrefix() string {
+	cfgMu.Lock()
+	defer cfgMu.Unlock()
+	return cfgModelPrefix
 }
 
 // loginCtx holds the cookie-affined HTTP client for one in-flight login flow.
@@ -701,6 +717,7 @@ func toAuthData(sa *storedAuth) pluginapi.AuthData {
 		// accounts (CN and Global alike) live side by side in the auth store.
 		ID:          providerName + "-" + identity,
 		FileName:    providerName + "-" + identity + ".json",
+		Prefix:      configuredModelPrefix(),
 		Label:       label,
 		StorageJSON: storage,
 		Metadata:    map[string]any{"type": providerName, "region": normalizeRegion(sa.Region)},
@@ -924,7 +941,7 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 	}
 	// CodeBuddy rejects non-stream requests (code 11101), so always stream
 	// upstream and fold the chunks into a single chat.completion object.
-	body := ensureSystemFirst(rewriteSystemForUpstream(forceStreamBody(req.Payload, req.OriginalRequest)), sa.Region)
+	body := stripModelPrefixInBody(ensureSystemFirst(rewriteSystemForUpstream(forceStreamBody(req.Payload, req.OriginalRequest)), sa.Region))
 	httpReq, err := http.NewRequest(http.MethodPost, baseFor(sa.Region)+pathChat, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -967,7 +984,7 @@ func handleExecStream(raw []byte) ([]byte, error) {
 	if len(body) == 0 {
 		body = req.OriginalRequest
 	}
-	body = ensureSystemFirst(rewriteSystemForUpstream(body), sa.Region)
+	body = stripModelPrefixInBody(ensureSystemFirst(rewriteSystemForUpstream(body), sa.Region))
 
 	headers := streamHeaders()
 	sseFramed := clientNeedsSSEFrame(req.Metadata)
@@ -1210,6 +1227,31 @@ func rewriteSystemForUpstream(payload []byte) []byte {
 // prompt"); CN accepts them, so this is scoped to Global to keep CN traffic
 // byte-identical. An empty system message is enough to satisfy the check and
 // does not influence the model.
+// stripModelPrefixInBody rewrites "<prefix>/<model>" back to "<model>" in the
+// outgoing payload. The host uses the prefix to pick an auth but forwards the
+// name the client used, and upstream only knows the bare id (it answers 11102
+// "service info not found" for the prefixed form).
+func stripModelPrefixInBody(payload []byte) []byte {
+	prefix := configuredModelPrefix()
+	if prefix == "" || len(payload) == 0 {
+		return payload
+	}
+	var obj map[string]any
+	if json.Unmarshal(payload, &obj) != nil {
+		return payload
+	}
+	id, _ := obj["model"].(string)
+	if !strings.HasPrefix(id, prefix+"/") {
+		return payload
+	}
+	obj["model"] = strings.TrimPrefix(id, prefix+"/")
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return payload
+	}
+	return out
+}
+
 func ensureSystemFirst(payload []byte, region string) []byte {
 	if normalizeRegion(region) != regionGlobal || len(payload) == 0 {
 		return payload
