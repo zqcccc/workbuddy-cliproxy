@@ -205,6 +205,8 @@ suggestion、提示词增强,不能走 chat completions)。
   `http://<host>:8317/v0/resource/plugins/workbuddy/quota`
 - 需要原始数据时用鉴权路由:`/v0/management/workbuddy/quota`(返回 JSON,
   账号名/uid 不脱敏)。加 `?refresh=1` 可跳过 60 秒缓存强制重查。
+  注意这里要的是 **management key**(`remote-management.secret-key`),`api-keys` 里
+  的 `sk-` 是给 `/v1` 用的,拿它访问会 401。
 
 页面数据来自上游 `POST /v2/billing/meter/get-user-resource`,由插件用
 `host.auth.list` / `host.auth.get` 取回**自己名下**的凭据后逐个查询。三个要点:
