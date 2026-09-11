@@ -159,10 +159,19 @@ func TestFetchQuotaParsesPackages(t *testing.T) {
 	if !first.HasSlice || first.SliceLeft != 120 || first.SliceTotal != 500 {
 		t.Errorf("slice = %v %v/%v, want 120/500", first.HasSlice, first.SliceLeft, first.SliceTotal)
 	}
+	// CapacityType 4 is what marks the package as refilling. It has to be read
+	// because upstream withholds the slice for most accounts, and the label
+	// picks its package by this flag.
+	if !first.Refills {
+		t.Errorf("refills = false, want true for CapacityType 4")
+	}
 	// 运营裂变包 is a free code in the client's list but does not refill.
 	second := got.Packages[1]
 	if !second.Free || second.Code != "TCACA_code_007_nzdH5h4Nl0" {
 		t.Fatalf("second package = %+v, want the free 007 package", second)
+	}
+	if second.Refills {
+		t.Errorf("bonus package marked as refilling: %+v", second)
 	}
 	if second.HasSlice {
 		t.Errorf("bonus package has a slice it should not: %+v", second)
@@ -354,6 +363,21 @@ func TestAppendBalanceToLabel(t *testing.T) {
 		{"balance", quotaAccount{Left: 1640}, base + " · 剩 1640 credits"},
 		{"fractional", quotaAccount{Left: 840.36}, base + " · 剩 840.36 credits"},
 		{"zero balance still shown", quotaAccount{Left: 0}, base + " · 剩 0 credits"},
+		// The refilling package is named after the total: it is the figure that
+		// comes back on its own, so it is worth a place in the list.
+		{"refilling package", quotaAccount{Left: 1640, Packages: []quotaPackage{
+			{Name: "体验版", Left: 500, Total: 500, Refills: true},
+			{Name: "运营裂变包", Left: 1140.36, Total: 1800},
+		}}, base + " · 剩 1640 credits · 体验版 500/500"},
+		// A reported slice outranks the CapacityType flag, and a package with
+		// no name at all must not leave a dangling separator.
+		{"slice wins", quotaAccount{Left: 100, Packages: []quotaPackage{
+			{Name: "体验版", Left: 0, Total: 500, Refills: true},
+			{Left: 120, Total: 500, HasSlice: true, SliceLeft: 120, SliceTotal: 500},
+		}}, base + " · 剩 100 credits"},
+		{"nameless package", quotaAccount{Left: 10, Packages: []quotaPackage{
+			{Left: 1, Total: 2, Refills: true},
+		}}, base + " · 剩 10 credits"},
 		// A failed lookup must leave the label untouched rather than printing
 		// a misleading "0".
 		{"lookup failed", quotaAccount{Error: "登录已过期"}, base},

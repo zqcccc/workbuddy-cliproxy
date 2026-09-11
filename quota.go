@@ -129,6 +129,11 @@ type quotaPackage struct {
 	// Free marks the free-plan/bonus packages, which refill on a cycle rather
 	// than being bought once.
 	Free bool `json:"free,omitempty"`
+	// Refills marks the packages upstream flags as CapacityType 4, the ones
+	// that top up every period. It is the more useful signal of the two: the
+	// slice details below are withheld for many accounts, but this flag comes
+	// with every api3 row.
+	Refills bool `json:"refills,omitempty"`
 	// Slice* carry the current refill period when upstream reports one. They
 	// are absent for accounts whose backend does not emit slice details, in
 	// which case Left/Total (the full cycle) are the only figures available.
@@ -225,10 +230,12 @@ type sliceUsage struct {
 }
 
 // packageFacts is what api3 adds to a package api1 already described: a
-// readable name, when the cycle ends, and the current refill slice.
+// readable name, when the cycle ends, whether it refills, and the current
+// refill slice.
 type packageFacts struct {
 	name     string
 	cycleEnd string
+	refills  bool
 	slice    *sliceUsage
 }
 
@@ -259,6 +266,11 @@ func freePackageFacts(base string, sa *storedAuth) map[string]packageFacts {
 		}
 		if end := cycleEndValue(pkg["CycleEndTime"]); end != "" {
 			fact.cycleEnd = end
+		}
+		// CapacityType is the only marker that survives for accounts whose
+		// backend withholds the slice details.
+		if numericValue(pkg["CapacityType"]) == capacityTypeSlice {
+			fact.refills = true
 		}
 		if size, left, ok := sliceOf(pkg); ok {
 			fact.slice = &sliceUsage{left: left, total: size}
@@ -436,6 +448,7 @@ func fetchQuotaFrom(base string, sa *storedAuth) quotaAccount {
 		}
 		if fact, ok := facts[code]; ok {
 			p.CycleEnd = fact.cycleEnd
+			p.Refills = fact.refills
 			if fact.slice != nil {
 				p.HasSlice = true
 				p.SliceLeft = fact.slice.left

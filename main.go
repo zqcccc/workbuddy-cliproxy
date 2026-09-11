@@ -788,18 +788,47 @@ func baseAuthLabel(sa *storedAuth) string {
 	return label
 }
 
-// appendBalance adds the remaining credit balance to a credential label.
+// appendBalance adds the remaining credits to a credential label, followed by
+// the package that refills when there is one
+// ("WorkBuddy (小楚) · 剩 665.26 credits · CodeBuddy个人体验版 0/500").
 //
 // The host renders a "quota" field in its auth-files list, but only for the
 // providers built into it: coreauth.ProviderSupportsQuotaObservation accepts
 // "claude" and "codex" and nothing else, so a plugin can never fill it. The
 // label is the one per-credential string a plugin does control, so the balance
-// rides along there ("WorkBuddy (小楚) · 剩 1640 credits").
+// rides along there.
+//
+// The refilling package is named because it is the number that moves on its
+// own: the bonus packs only ever run down, while this one comes back every
+// period. Naming it in the list saves a trip to the balance page.
 func appendBalance(label string, acc quotaAccount) string {
 	if acc.Error != "" {
 		return label
 	}
-	return label + " · 剩 " + formatCredits(acc.Left) + " credits"
+	out := label + " · 剩 " + formatCredits(acc.Left) + " credits"
+	if pkg, ok := refillingPackage(acc); ok && pkg.Name != "" {
+		out += " · " + pkg.Name + " " + formatCredits(pkg.Left) + "/" + formatCredits(pkg.Total)
+	}
+	return out
+}
+
+// refillingPackage picks the package that tops up every period.
+//
+// A reported slice is the strongest signal, but upstream withholds it for many
+// accounts, so CapacityType 4 (carried as Refills) is the fallback that
+// actually fires in production today.
+func refillingPackage(acc quotaAccount) (quotaPackage, bool) {
+	var byType quotaPackage
+	found := false
+	for _, pkg := range acc.Packages {
+		if !found && pkg.Refills {
+			byType, found = pkg, true
+		}
+		if pkg.HasSlice {
+			return pkg, true
+		}
+	}
+	return byType, found
 }
 
 // otherRegion returns the realm that is not the one given.
