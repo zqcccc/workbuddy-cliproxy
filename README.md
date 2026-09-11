@@ -276,7 +276,20 @@ WorkBuddy (小楚) · 剩 665.26 credits · CodeBuddy个人体验版 0/500
 这里有个宿主限制值得记一笔:CPA 的 auth-files 接口确实有 `quota` 字段,但
 `coreauth.ProviderSupportsQuotaObservation()` 把它**硬编码给了 `claude` 和 `codex`
 两个内置 provider**,外部插件填不进去,所以 Codex 那种"刷新额度"的展示方式对
-workbuddy 用不了。能用的只剩每条凭据的 `label`,于是余额挂在名字后面。
+workbuddy 用不了。能用的只剩凭据名字,但还藏着一个坑:**面板卡片的大标题渲染
+的是 `email` 字段,不是 `label`**(`label` 完全不渲染,`account` 也不渲染,
+email 为空才回落文件名)。Codex 卡看起来显示 label 只是因为它们的 label 恰好
+等于邮箱。
+
+`pluginapi.AuthData` 没有 Email 字段(只有 Label / Prefix / ProxyURL / Metadata /
+Attributes 等),只能走 `internal/api/handlers/management/auth_files.go:602
+authEmail()` 读的两个 map 之一:**`auth.Metadata["email"]` 和 `auth.Attributes["email"]`**。
+这里**用 `Attributes`,不要用 `Metadata`** —— `pluginTokenStorage.SaveTokenToFile`
+会用 `mergedStorageJSON(rawJSON, meta, provider)` 把 Metadata 合进落盘凭据,余额
+写进去就变陈旧。Attributes 只在宿主内存侧,`sdk/auth/filestore.go:349` 对内建
+provider 写的也是它。`main.go setAuthDisplay()` 在每次 parse / refresh 时把
+label 同步写一份到 `Attributes["email"]`,AuthData.Label 和 Attributes["email"]
+保持一致。
 
 更新时机是宿主 `auth.parse`(重启、凭据文件变化)和 `auth.refresh`(token 续期),
 两者都是"宿主把凭据交给插件、插件交还后由宿主落盘",没有并发写的问题。
