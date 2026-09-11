@@ -392,6 +392,10 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return handleExecExecute(request)
 	case pluginabi.MethodExecutorExecuteStream:
 		return handleExecStream(request)
+	case pluginabi.MethodManagementRegister:
+		return handleManagementRegister(request)
+	case pluginabi.MethodManagementHandle:
+		return handleManagement(request)
 	default:
 		return errorEnvelope("unknown_method", "unknown method: "+method), nil
 	}
@@ -429,6 +433,9 @@ type registrationCapability struct {
 	ExecutorModelScope    pluginapi.ExecutorModelScope `json:"executor_model_scope"`
 	ExecutorInputFormats  []string                     `json:"executor_input_formats,omitempty"`
 	ExecutorOutputFormats []string                     `json:"executor_output_formats,omitempty"`
+	// ManagementAPI exposes the credit balance page in the host UI. The host
+	// only sends management.register when this is set.
+	ManagementAPI bool `json:"management_api"`
 }
 
 type streamResponse struct {
@@ -452,6 +459,7 @@ func wbRegistration() registration {
 			ExecutorModelScope:    pluginapi.ExecutorModelScopeBoth,
 			ExecutorInputFormats:  []string{"chat-completions"},
 			ExecutorOutputFormats: []string{"chat-completions"},
+			ManagementAPI:         true,
 		},
 	}
 }
@@ -572,6 +580,32 @@ func parseStored(raw []byte) (*storedAuth, error) {
 		return nil, fmt.Errorf("storage_parse_error: %w", err)
 	}
 	if sa.Auth.AccessToken == "" {
+		// Tolerate the flat shape other tooling in this setup writes
+		// (top-level access_token / uid) instead of the nested one. Losing
+		// every credential because a sidecar rewrote the file is far worse
+		// than accepting both layouts.
+		var flat struct {
+			AccessToken  string `json:"access_token"`
+			RefreshToken string `json:"refresh_token"`
+			UID          string `json:"uid"`
+			Nickname     string `json:"nickname"`
+			EnterpriseID string `json:"enterpriseId"`
+			Domain       string `json:"domain"`
+			ExpiresAt    int64  `json:"expiresAt"`
+			Region       string `json:"region"`
+		}
+		if errFlat := json.Unmarshal(raw, &flat); errFlat == nil && flat.AccessToken != "" {
+			sa.Auth.AccessToken = flat.AccessToken
+			sa.Auth.RefreshToken = flat.RefreshToken
+			sa.Auth.Domain = flat.Domain
+			sa.Auth.ExpiresAt = flat.ExpiresAt
+			sa.Account.UID = flat.UID
+			sa.Account.Nickname = flat.Nickname
+			sa.Account.EnterpriseID = flat.EnterpriseID
+			sa.Region = normalizeRegion(flat.Region)
+			hostLog("warn", "workbuddy: parsed credential in flat layout", map[string]any{"uid": flat.UID})
+			return &sa, nil
+		}
 		return nil, fmt.Errorf("parse_error: missing accessToken")
 	}
 	return &sa, nil

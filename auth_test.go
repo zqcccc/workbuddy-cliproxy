@@ -400,3 +400,40 @@ func TestStripModelPrefixInBody(t *testing.T) {
 		}
 	}
 }
+
+func TestParseStoredAcceptsFlatLayout(t *testing.T) {
+	// Sidecar tooling in this setup sometimes rewrites the credential file in a
+	// flat layout instead of the nested one. Losing every credential to that is
+	// far worse than accepting both.
+	flat := []byte(`{"access_token":"AT","refresh_token":"RT","uid":"uid-flat",` +
+		`"nickname":"Flat","domain":"www.workbuddy.ai","expiresAt":123,"region":"global"}`)
+	sa, err := parseStored(flat)
+	if err != nil {
+		t.Fatalf("parseStored(flat): %v", err)
+	}
+	if sa.Auth.AccessToken != "AT" || sa.Auth.RefreshToken != "RT" {
+		t.Fatalf("tokens = %q / %q", sa.Auth.AccessToken, sa.Auth.RefreshToken)
+	}
+	if sa.Account.UID != "uid-flat" || sa.Account.Nickname != "Flat" {
+		t.Fatalf("account = %+v", sa.Account)
+	}
+	if sa.Region != regionGlobal {
+		t.Fatalf("region = %q, want global", sa.Region)
+	}
+
+	// The nested layout still wins when both are present.
+	nested := []byte(`{"region":"cn","auth":{"accessToken":"N","refreshToken":"NR"},` +
+		`"account":{"uid":"uid-n","nickname":"Nested"},"access_token":"OLD"}`)
+	sa, err = parseStored(nested)
+	if err != nil {
+		t.Fatalf("parseStored(nested): %v", err)
+	}
+	if sa.Auth.AccessToken != "N" || sa.Account.UID != "uid-n" {
+		t.Fatalf("nested not preferred: %+v", sa)
+	}
+
+	// A file with neither shape is still an error.
+	if _, err := parseStored([]byte(`{"foo":1}`)); err == nil {
+		t.Fatal("expected an error for a credential with no token")
+	}
+}
