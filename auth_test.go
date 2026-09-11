@@ -87,6 +87,37 @@ func TestToAuthDataPerAccount(t *testing.T) {
 	}
 }
 
+// TestAuthDataEmailMirrorsLabel is the regression test for "the balance never
+// shows up in the auth-files list". The host's card renders the "email" field
+// as its headline and only falls back to the file name; it never renders
+// "label". Every built-in provider has label == email, which hid this from us
+// for three deploys. The plugin protocol has no Email field, so the display
+// name has to be mirrored into Attributes["email"].
+func TestAuthDataEmailMirrorsLabel(t *testing.T) {
+	sa := &storedAuth{
+		Auth:    storedTokens{AccessToken: "a", RefreshToken: "r"},
+		Account: storedAccount{UID: "uid-one", Nickname: "One"},
+	}
+	auth := toAuthData(sa)
+
+	if auth.Label == "" {
+		t.Fatal("label is empty")
+	}
+	if got := auth.Attributes["email"]; got != auth.Label {
+		t.Errorf(`Attributes["email"] = %q, want the label %q`, got, auth.Label)
+	}
+	// Metadata is merged into the persisted auth file by the host, so a balance
+	// must never be written there: it would survive on disk and go stale.
+	if v, ok := auth.Metadata["email"]; ok {
+		t.Errorf(`Metadata["email"] = %v, must stay unset`, v)
+	}
+	// A nil attribute map would be replaced wholesale by the host, losing the
+	// value, so it has to be non-nil and writable.
+	if auth.Attributes == nil {
+		t.Fatal("Attributes is nil")
+	}
+}
+
 func TestRegionStoredRoundTrip(t *testing.T) {
 	raw := []byte(`{"region":"global","auth":{"accessToken":"t","refreshToken":"r","expiresAt":1},"account":{"uid":"u"}}`)
 	sa, err := parseStored(raw)

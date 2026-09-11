@@ -449,8 +449,8 @@ func wbRegistration() registration {
 		Metadata: pluginapi.Metadata{
 			Name:             providerName,
 			Version:          "0.1.0",
-			Author:           "lovingfish (clean-room rebuild; original workbuddy by Sliverkiss)",
-			GitHubRepository: "https://github.com/lovingfish/workbuddy-cliproxy",
+			Author:           "zqcccc (clean-room rebuild; original workbuddy by Sliverkiss)",
+			GitHubRepository: "https://github.com/zqcccc/workbuddy-cliproxy",
 		},
 		Capabilities: registrationCapability{
 			ModelProvider:         true,
@@ -736,8 +736,8 @@ func handleParseAuth(raw []byte) ([]byte, error) {
 }
 
 // authDataWithBalance is toAuthData with the remaining credits appended to the
-// label, so the balance shows up next to the credential in the host's
-// auth-files list. A failed lookup keeps the plain label: parsing must never
+// display name, so the balance shows up next to the credential in the host's
+// auth-files list. A failed lookup keeps the plain name: parsing must never
 // fail because the billing endpoint was unreachable.
 func authDataWithBalance(sa *storedAuth) pluginapi.AuthData {
 	auth := toAuthData(sa)
@@ -753,24 +753,48 @@ func authDataWithBalance(sa *storedAuth) pluginapi.AuthData {
 		"uid":  sa.Account.UID,
 		"left": acc.Left,
 	})
-	auth.Label = appendBalance(baseAuthLabel(sa), acc)
+	setAuthDisplay(&auth, appendBalance(baseAuthLabel(sa), acc))
 	return auth
 }
 
 func toAuthData(sa *storedAuth) pluginapi.AuthData {
 	storage, _ := json.Marshal(sa)
 	identity := accountIdentity(sa)
-	return pluginapi.AuthData{
+	auth := pluginapi.AuthData{
 		Provider: providerName,
 		// Per-account ID and file name: this is what lets several CodeBuddy
 		// accounts (CN and Global alike) live side by side in the auth store.
 		ID:          providerName + "-" + identity,
 		FileName:    providerName + "-" + identity + ".json",
 		Prefix:      configuredModelPrefix(),
-		Label:       baseAuthLabel(sa),
 		StorageJSON: storage,
 		Metadata:    map[string]any{"type": providerName, "region": normalizeRegion(sa.Region)},
 	}
+	setAuthDisplay(&auth, baseAuthLabel(sa))
+	return auth
+}
+
+// setAuthDisplay publishes a credential's human-readable name, which for us is
+// "WorkBuddy (小楚) · 剩 665.26 credits · CodeBuddy个人体验版 0/500".
+//
+// AuthData.Label alone is not enough: the host's auth-files list renders the
+// "email" field as the card headline and only falls back to the file name.
+// Every built-in provider happens to carry label == email, which is why their
+// names show up and ours did not — the plugin protocol has no Email field
+// (pluginapi.AuthData has Label, Prefix, ProxyURL, Metadata, Attributes and
+// nothing else), so the only way in is one of the two maps authEmail() reads.
+//
+// We use Attributes, not Metadata: Metadata is merged into the persisted auth
+// file by pluginTokenStorage.SaveTokenToFile (mergedStorageJSON), so a balance
+// written there would survive on disk and go stale. Attributes stay host-side,
+// and Attributes["email"] is exactly where sdk/auth/filestore.go puts the email
+// for file-based providers, so the value is rebuilt on every parse and refresh.
+func setAuthDisplay(auth *pluginapi.AuthData, label string) {
+	auth.Label = label
+	if auth.Attributes == nil {
+		auth.Attributes = map[string]string{}
+	}
+	auth.Attributes["email"] = label
 }
 
 // baseAuthLabel is the credential name shown in the host UI.
