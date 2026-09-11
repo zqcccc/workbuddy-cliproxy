@@ -294,6 +294,12 @@ func fetchQuotaFrom(base string, sa *storedAuth) quotaAccount {
 // upstream round trip. A minute of caching collapses those repeats while
 // keeping a manual host refresh responsive.
 func cachedAccountBalance(sa *storedAuth) quotaAccount {
+	return cachedBalance(sa, fetchQuota)
+}
+
+// cachedBalance is cachedAccountBalance with the lookup injected, so tests can
+// count how often upstream is actually reached.
+func cachedBalance(sa *storedAuth, fetch func(*storedAuth) quotaAccount) quotaAccount {
 	key := strings.TrimSpace(sa.Account.UID)
 	if key == "" {
 		key = accountIdentity(sa)
@@ -306,7 +312,7 @@ func cachedAccountBalance(sa *storedAuth) quotaAccount {
 	}
 	quotaMu.Unlock()
 
-	account := fetchQuota(sa)
+	account := fetch(sa)
 
 	quotaMu.Lock()
 	quotaBalanceCache[key] = quotaBalanceEntry{account: account, at: time.Now()}

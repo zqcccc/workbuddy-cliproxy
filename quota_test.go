@@ -227,6 +227,35 @@ func TestBaseAuthLabel(t *testing.T) {
 	}
 }
 
+func TestCachedBalanceReusesUpstreamWithinTTL(t *testing.T) {
+	// The host parses the same credential several times in one reload; only the
+	// first parse may reach upstream.
+	calls := 0
+	fetch := func(*storedAuth) quotaAccount {
+		calls++
+		return quotaAccount{Left: float64(100 + calls)}
+	}
+	sa := testStoredAuth()
+	first := cachedBalance(sa, fetch)
+	second := cachedBalance(sa, fetch)
+	if calls != 1 {
+		t.Fatalf("upstream calls = %d, want 1", calls)
+	}
+	if first.Left != 101 || second.Left != 101 {
+		t.Errorf("balances = %v / %v, want the cached 101 twice", first.Left, second.Left)
+	}
+	// Expiring the entry is what makes a later host refresh pick up a new
+	// balance instead of showing a stale one forever.
+	quotaMu.Lock()
+	quotaBalanceCache[sa.Account.UID] = quotaBalanceEntry{
+		account: first, at: time.Now().Add(-quotaCacheTTL - time.Second),
+	}
+	quotaMu.Unlock()
+	if got := cachedBalance(sa, fetch); got.Left != 102 || calls != 2 {
+		t.Errorf("after expiry: balance = %v, calls = %d, want 102 / 2", got.Left, calls)
+	}
+}
+
 func TestNumericValue(t *testing.T) {
 	cases := []struct {
 		in   any

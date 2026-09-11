@@ -120,7 +120,8 @@ func renderQuotaHTML(snapshot quotaSnapshot, masked bool) string {
 	b.WriteString(pageCSS)
 	b.WriteString(`</style></head><body><main>`)
 	b.WriteString(`<h1>workbuddy 额度</h1>`)
-	b.WriteString(`<p class="meta">更新时间 ` + html.EscapeString(snapshot.GeneratedAt.Local().Format("2006-01-02 15:04:05")) + ` · 缓存 60 秒</p>`)
+	b.WriteString(`<p class="meta">更新时间 ` + html.EscapeString(snapshot.GeneratedAt.Local().Format("2006-01-02 15:04:05")) +
+		` · 缓存 60 秒 · <a href="?refresh=1">立即刷新</a></p>`)
 
 	if snapshot.Error != "" {
 		b.WriteString(`<p class="err">` + html.EscapeString(snapshot.Error) + `</p>`)
