@@ -327,6 +327,19 @@ func modelCacheStore(key string, models []pluginapi.ModelInfo) {
 // bundled fallback list so /v1/models never comes back empty.
 func modelsForAuth(req pluginapi.AuthModelRequest, sa *storedAuth) []pluginapi.ModelInfo {
 	key := modelCacheKey(req, sa)
+	noteIdentity(accountIdentity(sa))
+
+	// A credential that upstream asked us to back off from stops advertising
+	// models, so the host serves the same id from a different credential.
+	// Deliberately not cached: the list has to come back the moment the
+	// cooldown expires.
+	if suppressModels(sa) {
+		hostLog("info", "workbuddy: credential still cooling, withholding models", map[string]any{
+			"uid": sa.Account.UID,
+		})
+		return nil
+	}
+
 	if cached := modelCacheLookup(key); cached != nil {
 		return cached
 	}

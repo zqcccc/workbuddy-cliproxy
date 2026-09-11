@@ -954,8 +954,12 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
 		payload, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode == http.StatusTooManyRequests {
+			markCooldown(sa, resp)
+		}
 		return nil, fmt.Errorf("upstream %d: %s", resp.StatusCode, truncate(string(payload), 200))
 	}
+	clearCooldown(sa)
 	completion, err := aggregateCompletion(resp.Body, req.Model)
 	if err != nil {
 		return nil, err
@@ -1007,7 +1011,7 @@ func handleExecStream(raw []byte) ([]byte, error) {
 		return okEnvelope(streamResponse{Headers: headers})
 	}
 	backendHeaders(httpReq, sa)
-	go pumpUpstreamStream(httpReq, req.StreamID, sseFramed)
+	go pumpUpstreamStream(httpReq, req.StreamID, sseFramed, sa)
 	return okEnvelope(streamResponse{Headers: headers})
 }
 
@@ -1023,7 +1027,7 @@ func streamHeaders() http.Header {
 // emits each cleaned chunk to the host stream. It closes the stream when done.
 // An emit failure (client disconnected → host closed the stream) aborts the
 // pump so we stop reading a dead upstream.
-func pumpUpstreamStream(httpReq *http.Request, streamID string, sseFramed bool) {
+func pumpUpstreamStream(httpReq *http.Request, streamID string, sseFramed bool, sa *storedAuth) {
 	resp, err := sharedHTTPClient().Do(httpReq)
 	if err != nil {
 		streamEmitError(streamID, fmt.Sprintf("http_error: %v", err))
@@ -1033,10 +1037,14 @@ func pumpUpstreamStream(httpReq *http.Request, streamID string, sseFramed bool) 
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
 		errPayload, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode == http.StatusTooManyRequests {
+			markCooldown(sa, resp)
+		}
 		streamEmitError(streamID, fmt.Sprintf("upstream %d: %s", resp.StatusCode, truncate(string(errPayload), 200)))
 		streamClose(streamID)
 		return
 	}
+	clearCooldown(sa)
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 	for scanner.Scan() {
@@ -1073,8 +1081,12 @@ func collectUpstreamStream(body []byte, sa *storedAuth, sseFramed bool) ([]plugi
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
 		errPayload, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode == http.StatusTooManyRequests {
+			markCooldown(sa, resp)
+		}
 		return nil, fmt.Errorf("upstream %d: %s", resp.StatusCode, truncate(string(errPayload), 200))
 	}
+	clearCooldown(sa)
 	return aggregateSSE(resp.Body, sseFramed), nil
 }
 
