@@ -38,17 +38,31 @@ access token 的短哈希)。国内号和国际号可以并存,互不覆盖。
 `ensureSystemFirst` 处理:仅在 `region: global` 时补一条**空内容**的 system 消息
 (实测空 system 就能通过校验,且不干扰模型输出)。国内版请求保持逐字节不变。
 
-### 登录时怎么选区
+### 装成两个插件:一区一个(推荐)
 
 宿主调 `auth.login.start` 时只给插件 `provider` 和 `baseURL`,**不传任何自定义入参**
-(`Metadata` 永远是空的),而一个插件又只能注册一个 provider id —— 所以没法在界面上选区。
+(`Metadata` 永远是空的),而**一个插件只能注册一个 provider id**。所以单个插件的登录按钮
+只能给一个区的链接,没法在界面上选区。
 
-绕过的办法:**一次"登录"同时向两个区各申请一个 login state**。
+解法是**同一份代码编出两个 .so**,每区一个:
 
-- 返回的 `URL` 是**主区**的,主区由 `region` 配置决定(默认 `cn`)。
-- 另一个区的 URL 放在返回值的 `metadata` 里(`cn_url` / `global_url`,附对应 `state`),
-  同时**两个 URL 都会打到 CPA 日志**。
-- 两个 state 都挂着,**你扫哪个码,建档就是哪个区** —— 不用改配置、不用重启。
+| 文件 | plugin id | provider | 区 | 上游 |
+| --- | --- | --- | --- | --- |
+| `workbuddy.so` | `workbuddy` | `workbuddy` | cn | `copilot.tencent.com` |
+| `workbuddy-global.so` | `workbuddy-global` | `workbuddy-global` | global | `www.workbuddy.ai` |
+
+依据(读 `CLIProxyAPI` 源码确认):
+
+- `internal/pluginstore/install.go` `pluginIDFromPath`:**plugin id 就是文件名去掉扩展名**,
+  且必须匹配 `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`。
+- `internal/pluginhost/auth_provider.go` `ParseAuths`:provider 为空时按序问每个插件,
+  **第一个返回 `handled` 的接管**;provider 非空时按 id **精确匹配**。
+- `internal/watcher/synthesizer/file.go`:扫描凭据目录时用文件里的 `"type"` 字段当 provider
+  —— 所以两个插件靠凭据文件的 `type` 天然分流,不会互相抢账号。
+
+```bash
+./build.sh          # 产出 workbuddy.so (cn) 和 workbuddy-global.so (global)
+```
 
 ```yaml
 plugins:
@@ -58,13 +72,29 @@ plugins:
     workbuddy:
       enabled: true
       priority: 100
-      region: cn          # 只决定主 URL 是哪个区,cn(默认) | global
+      region: cn
+    workbuddy-global:
+      enabled: true
+      priority: 100
+      region: global
 ```
 
-次要区是 best-effort:国际版在国内网络经常连不通,失败时只记一条日志,**不影响主区登录**。
+**区的选择靠 build tag,不靠 ldflags**:`providerName` / `buildRegion` 定义在
+`provider_cn.go`(`//go:build !global`)和 `provider_global.go`(`//go:build global`)里,
+`build.sh` 用 `-tags global` 选。试过 `-ldflags -X`,对 `-buildmode=c-shared` 的产物
+**时灵时不灵**(字符串进了 buildinfo 但变量没被改写,表现为 `plugin_name` 仍是
+`workbuddy`),build tag 是确定的。
+
+面板上会看到两个 provider,各自一个登录按钮,点哪个就是哪个区 —— 不用改配置、不用重启。
+两个插件同时装时,前面那个"一次登录给两个区 URL"的逻辑仍然保留为兜底(次要区的 URL 在
+`metadata` 里),但已经不是主要路径了。
 
 区域会写进每个账号的凭据文件(`"region":"global"`),之后该账号的刷新、模型发现、聊天请求
 都固定走它自己的区。老凭据文件没有 `region` 字段,按 `cn` 处理,向后兼容。
+
+> **迁移**:单插件时代建的 Global 账号,凭据文件叫 `workbuddy-<uid>.json` 且 `"type":
+> "workbuddy"`。改成 `workbuddy-global-<uid>.json` + `"type": "workbuddy-global"` 就会被
+> 国际版插件接管(CN 插件凭 `type` 精确匹配不会再抢它)。
 
 ## 模型
 

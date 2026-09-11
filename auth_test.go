@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -61,8 +62,12 @@ func TestToAuthDataPerAccount(t *testing.T) {
 	if a.ID == b.ID {
 		t.Fatalf("two accounts share ID %q", a.ID)
 	}
-	if a.FileName != "workbuddy-uid-one.json" || b.FileName != "workbuddy-uid-two.json" {
-		t.Errorf("file names = %q / %q", a.FileName, b.FileName)
+	// Asserted against providerName so the suite also passes for the
+	// workbuddy-global.so build (-tags global).
+	wantA := providerName + "-uid-one.json"
+	wantB := providerName + "-uid-two.json"
+	if a.FileName != wantA || b.FileName != wantB {
+		t.Errorf("file names = %q / %q, want %q / %q", a.FileName, b.FileName, wantA, wantB)
 	}
 	if a.Provider != providerName || b.Provider != providerName {
 		t.Errorf("provider must stay %q", providerName)
@@ -237,5 +242,40 @@ func TestEnsureSystemFirst(t *testing.T) {
 		if got := ensureSystemFirst([]byte(bad), regionGlobal); string(got) != bad {
 			t.Fatalf("input %q became %q", bad, got)
 		}
+	}
+}
+
+func TestConfigRegionNotClobberedByRegionlessBlock(t *testing.T) {
+	restore := configuredRegion()
+	t.Cleanup(func() { setConfiguredRegionForTest(restore) })
+
+	// A workbuddy-global.so must stay global even when its config block omits
+	// the region key, otherwise it silently degrades to CN.
+	setConfiguredRegionForTest(regionGlobal)
+	body, err := json.Marshal(map[string]any{"config_yaml": []byte("enabled: true\npriority: 100\n")})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	applyConfigYAML(body)
+	if got := configuredRegion(); got != regionGlobal {
+		t.Fatalf("regionless config block changed region to %q, want global", got)
+	}
+}
+
+func TestProviderNameIsValidPluginID(t *testing.T) {
+	// The host derives a plugin's id from its file name and rejects ids that
+	// do not match this pattern, which would silently disable the plugin.
+	valid := regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+	if !valid.MatchString(providerName) {
+		t.Fatalf("providerName %q is not a valid plugin id", providerName)
+	}
+	// Credential file names are derived from it, so it must be path-safe too.
+	if strings.ContainsAny(providerName, `/\ `) {
+		t.Fatalf("providerName %q is not safe in a file name", providerName)
+	}
+	switch buildRegion {
+	case regionCN, regionGlobal:
+	default:
+		t.Fatalf("buildRegion = %q, want cn or global", buildRegion)
 	}
 }

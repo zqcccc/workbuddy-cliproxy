@@ -78,7 +78,6 @@ import (
 )
 
 const (
-	providerName = "workbuddy"
 	// authFileName is the legacy single-account file name. It is kept only so
 	// an already-stored workbuddy.json still parses; every account written from
 	// now on uses workbuddy-<identity>.json so multiple accounts can coexist.
@@ -102,6 +101,15 @@ const (
 
 	loginTTL = 5 * time.Minute
 )
+
+// providerName and buildRegion are defined in provider_cn.go / provider_global.go
+// and selected with a build tag, so one source tree builds two plugin files.
+//
+// This is the only way to offer both realms at once: the host derives a
+// plugin's id from its file name, and a plugin can only register a single auth
+// provider identifier. A second file is therefore a second provider, and the
+// UI shows one login button per provider instead of one button whose realm is
+// decided by config. See build.sh.
 
 // normalizeRegion folds anything unrecognised onto the CN realm so a missing or
 // typo'd value keeps behaving like the deployment this plugin shipped for.
@@ -136,7 +144,7 @@ type pluginConfig struct {
 
 var (
 	cfgMu     sync.Mutex
-	cfgRegion = regionCN
+	cfgRegion = buildRegion
 )
 
 // applyConfigYAML reads the host-supplied config block from a plugin.register /
@@ -151,6 +159,12 @@ func applyConfigYAML(raw []byte) {
 	}
 	var cfg pluginConfig
 	if yaml.Unmarshal(envelope.ConfigYAML, &cfg) != nil {
+		return
+	}
+	// An absent region must not clobber the realm this binary was built for,
+	// otherwise a workbuddy-global.so would silently fall back to CN whenever
+	// its config block omits the key.
+	if strings.TrimSpace(cfg.Region) == "" {
 		return
 	}
 	cfgMu.Lock()

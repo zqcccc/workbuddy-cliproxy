@@ -15,3 +15,5 @@ workbuddy.json
 *.swp
 .idea/
 .vscode/
+.workbuddy-ai
+workbuddy-cliproxy
