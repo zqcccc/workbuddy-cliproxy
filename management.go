@@ -57,10 +57,29 @@ func handleManagementRegister(raw []byte) ([]byte, error) {
 		}},
 		Resources: []pluginapi.ResourceRoute{{
 			Path:        quotaResourcePath,
-			Menu:        "额度",
+			Menu:        quotaMenuName(),
 			Description: "每个 workbuddy 账号的剩余积分（浏览器可直接打开）",
 		}},
 	})
+}
+
+// quotaMenuName is the sidebar entry for this plugin's balance page.
+//
+// CN and Global ship as two separate plugins (one provider per .so), and both
+// used to register the bare label "额度". The operator then saw two identical
+// menu items with no way to tell which realm a balance belonged to, so the
+// realm is spelled out instead: "workbuddy 额度" vs "workbuddy 国际版额度".
+func quotaMenuName() string {
+	if normalizeRegion(buildRegion) == regionGlobal {
+		return "workbuddy 国际版额度"
+	}
+	return "workbuddy 额度"
+}
+
+// quotaPageTitle is the heading of the balance page. It matches the menu entry
+// so the page and the sidebar agree on which realm the numbers belong to.
+func quotaPageTitle() string {
+	return quotaMenuName()
 }
 
 // handleManagement serves both routes registered above.
@@ -116,10 +135,10 @@ func renderQuotaHTML(snapshot quotaSnapshot, masked bool) string {
 	var b strings.Builder
 	b.WriteString(`<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">`)
 	b.WriteString(`<meta name="viewport" content="width=device-width,initial-scale=1">`)
-	b.WriteString(`<title>workbuddy 额度</title><style>`)
+	b.WriteString(`<title>` + html.EscapeString(quotaPageTitle()) + `</title><style>`)
 	b.WriteString(pageCSS)
 	b.WriteString(`</style></head><body><main>`)
-	b.WriteString(`<h1>workbuddy 额度</h1>`)
+	b.WriteString(`<h1>` + html.EscapeString(quotaPageTitle()) + `</h1>`)
 	b.WriteString(`<p class="meta">更新时间 ` + html.EscapeString(snapshot.GeneratedAt.Local().Format("2006-01-02 15:04:05")) +
 		` · 缓存 60 秒 · <a href="?refresh=1">立即刷新</a></p>`)
 
@@ -154,6 +173,17 @@ func renderQuotaHTML(snapshot quotaSnapshot, masked bool) string {
 			continue
 		}
 		b.WriteString(`<p class="total">剩余 <strong>` + formatCredits(acc.Left) + `</strong> credits</p>`)
+		// Total capacity is what the account was granted this cycle, so
+		// remaining-over-granted is the number an operator actually watches.
+		var granted float64
+		for _, pkg := range acc.Packages {
+			granted += pkg.Total
+		}
+		if granted > 0 {
+			b.WriteString(`<p class="barlabel">占本轮总额度 ` + formatCredits(pctOf(acc.Left, granted)) +
+				`% <span class="quiet">(` + formatCredits(acc.Left) + ` / ` + formatCredits(granted) + `)</span></p>`)
+			renderBar(&b, acc.Left, granted, false)
+		}
 		// Free packages refill on a cycle, so they are the ones an operator
 		// watches; listing them apart from the one-off purchases is the whole
 		// point of reading api3 at all.
@@ -201,10 +231,48 @@ func renderPackageTable(b *strings.Builder, title string, pkgs []quotaPackage, s
 			}
 			b.WriteString(`</td>`)
 		}
-		b.WriteString(`<td class="num">` + formatCredits(pkg.Left) + ` / ` + formatCredits(pkg.Total) +
-			`</td><td>` + html.EscapeString(pkg.CycleEnd) + `</td></tr>`)
+		b.WriteString(`<td class="num">` + formatCredits(pkg.Left) + ` / ` + formatCredits(pkg.Total))
+		renderBar(b, pkg.Left, pkg.Total, true)
+		b.WriteString(`</td><td>` + html.EscapeString(pkg.CycleEnd) + `</td></tr>`)
 	}
 	b.WriteString(`</tbody></table>`)
+}
+
+// renderBar writes a filled progress bar for left-of-total. The colour follows
+// the same three tiers the host uses for its own quota bars (>=70 high, >=30
+// medium, else low) so this page reads consistently with the built-in
+// providers' cards.
+func renderBar(b *strings.Builder, left, total float64, small bool) {
+	pct := pctOf(left, total)
+	cls := "bar-low"
+	switch {
+	case pct >= 70:
+		cls = "bar-high"
+	case pct >= 30:
+		cls = "bar-mid"
+	}
+	b.WriteString(`<div class="bar`)
+	if small {
+		b.WriteString(` bar-sm`)
+	}
+	b.WriteString(`"><div class="bar-fill ` + cls + `" style="width:` + formatCredits(pct) + `%"></div></div>`)
+}
+
+// pctOf is left as a percentage of total, clamped to 0..100. A zero or missing
+// total means "no bar" rather than a full one: the upstream does not always
+// report a package size, and 0/0 must not render as 100% left.
+func pctOf(left, total float64) float64 {
+	if total <= 0 {
+		return 0
+	}
+	pct := left / total * 100
+	if pct < 0 {
+		return 0
+	}
+	if pct > 100 {
+		return 100
+	}
+	return pct
 }
 
 // formatCredits renders a whole number without decimals and a fractional one
@@ -233,6 +301,13 @@ h3{font-size:13px;font-weight:500;color:#374151;margin:14px 0 4px}
 .badge{background:#eef2ff;color:#3730a3;border-radius:999px;padding:2px 10px;font-size:12px}
 .total{margin:0 0 12px}
 .total strong{font-size:22px}
+.barlabel{margin:0;font-size:12px;color:#374151}
+.bar{height:10px;background:#eef0f3;border-radius:999px;overflow:hidden;margin:6px 0 2px}
+.bar-sm{height:6px;margin:4px 0 0}
+.bar-fill{height:100%;border-radius:999px;transition:width .2s}
+.bar-high{background:#16a34a}
+.bar-mid{background:#e0aa14}
+.bar-low{background:#dc2626}
 table{width:100%;border-collapse:collapse}
 th,td{text-align:left;padding:6px 8px;border-bottom:1px solid #f0f1f3;font-size:13px}
 th{color:#6b7280;font-weight:500}

@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"html"
 	"net/http"
 	"strings"
 	"testing"
@@ -89,8 +90,44 @@ func TestManagementHandleResourceRendersHTML(t *testing.T) {
 	if ct := resp.Headers.Get("Content-Type"); !strings.Contains(ct, "text/html") {
 		t.Errorf("content type = %q, want text/html", ct)
 	}
-	if !strings.Contains(string(resp.Body), "<h1>workbuddy 额度</h1>") {
-		t.Error("body is not the balance page")
+	if !strings.Contains(string(resp.Body), "<h1>"+html.EscapeString(quotaPageTitle())+"</h1>") {
+		t.Errorf("body is not the balance page (want the %q heading)", quotaPageTitle())
+	}
+}
+
+// TestQuotaMenuNameDistinguishesRealms is the regression test for "both
+// plugins show a menu entry called 额度". CN and Global are separate .so
+// files, so without the realm in the name the operator cannot tell the two
+// sidebar entries apart.
+func TestQuotaMenuNameDistinguishesRealms(t *testing.T) {
+	// The realm must follow this binary, not a runtime config value.
+	want := "workbuddy 额度"
+	if normalizeRegion(buildRegion) == regionGlobal {
+		want = "workbuddy 国际版额度"
+	}
+	if got := quotaMenuName(); got != want {
+		t.Errorf("quotaMenuName() = %q, want %q for buildRegion %q", got, want, buildRegion)
+	}
+	if quotaPageTitle() != want {
+		t.Errorf("quotaPageTitle() = %q, want it to match the menu entry %q", quotaPageTitle(), want)
+	}
+}
+
+func TestPctOfClamps(t *testing.T) {
+	cases := []struct {
+		name        string
+		left, total float64
+		want        float64
+	}{
+		{"normal", 25, 100, 25},
+		{"zero total", 5, 0, 0},
+		{"over", 150, 100, 100},
+		{"negative", -5, 100, 0},
+	}
+	for _, c := range cases {
+		if got := pctOf(c.left, c.total); got != c.want {
+			t.Errorf("%s: pctOf(%v,%v) = %v, want %v", c.name, c.left, c.total, got, c.want)
+		}
 	}
 }
 

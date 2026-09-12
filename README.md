@@ -216,8 +216,13 @@ suggestion、提示词增强,不能走 chat completions)。
 
 ## 额度(剩余积分)
 
-插件带一个 Management API 扩展,装好并重启后 CPA 面板左侧会出现 **额度** 菜单,
-直接列出每个 workbuddy 账号还剩多少 credits、每个资源包的剩余/总量与周期截止时间。
+插件带一个 Management API 扩展,装好并重启后 CPA 面板左侧会出现额度菜单,
+直接列出每个 workbuddy 账号还剩多少 credits、每个资源包的剩余/总量与周期截止时间,
+每个包配一条进度条(≥70% 绿、≥30% 黄、<30% 红,和宿主内置 provider 的配色一致)。
+
+菜单名**带区名**:国内插件是 **workbuddy 额度**,国际插件是 **workbuddy 国际版额度**。
+两个插件是分开的两个 .so,如果都叫「额度」,面板里就是两条一模一样的菜单,
+看不出哪个余额属于哪个区。页面标题与菜单名保持一致。
 
 - 页面地址:`/v0/resource/plugins/<pluginID>/quota`,例如
   `http://<host>:8317/v0/resource/plugins/workbuddy/quota`
@@ -295,6 +300,32 @@ label 同步写一份到 `Attributes["email"]`,AuthData.Label 和 Attributes["em
 两者都是"宿主把凭据交给插件、插件交还后由宿主落盘",没有并发写的问题。
 **插件不会用 `host.auth.save` 回写**:那是整文件覆盖,和宿主自己的 refresh 抢写,
 一旦覆盖到旧 token 就把凭据弄废了。
+
+### 为什么卡片上做不了官方那种 CSS 进度条
+
+Antigravity / Claude / Codex 卡片里那些「套餐 Pro → Five Hour Limit Remaining」
+的进度条,是这么来的:
+
+1. 宿主有个**通用的上游穿透接口** `POST /v0/management/api-call`
+   (`internal/api/handlers/management/api_tools.go`),传 `auth_index` + `method` +
+   `url` + `header` + `data`,header 支持 `$TOKEN$` 魔法变量(从
+   `metadata.access_token` / `attributes.api_key` / `metadata.token` 取值),
+   宿主拿该凭据的 token 代发请求。
+2. 前端 bundle(`/CLIProxyAPI/static/management.html`)里**写死了 5 个 quota 配置**
+   (antigravity / claude / codex / kimi / xai),每个带自己的 `filterFn` +
+   `fetchQuota`。Antigravity 的 `fetchQuota` 就是拿 `api-call` 去打 Google 的
+   `v1internal:retrieveUserQuotaSummary`。
+3. 前端把返回的 `{groups, subscription, serverTimeOffsetMs}` 渲染成
+   `quotaBarFill{High,Medium,Low}`(≥70 / ≥30 / <30 三档配色)。
+
+**插件插不进去**:`sdk/pluginapi` 里 `quota` 零命中(既没 quota 字段也没 quota 方法),
+前端那 5 个配置也不是后端下发的列表、没有 plugin 注册槽。所以卡片上做不了;
+真·CSS 进度条只在我们自己的额度页上有(见上一节)。
+
+另外 `ProviderSupportsQuotaObservation`(被动扫响应头那条路)只放 `claude`/`codex`,
+而且有测试 `TestObserveResponseHeadersDropsKimiGrokAndAntigravitySignals` 明说
+antigravity 的信号会被丢弃 —— 所以 antigravity 的条**不是**走被动观察,是走前端
+主动 `fetchQuota` + `api-call`。
 
 ## 安装
 
