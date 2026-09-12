@@ -53,12 +53,12 @@ func handleManagementRegister(raw []byte) ([]byte, error) {
 			// registering the same path from both makes the host skip the
 			// lower-priority one ("conflicts with a higher-priority plugin").
 			Path:        base + "/" + providerName + "/quota",
-			Description: "workbuddy 各账号剩余积分(JSON,需管理鉴权)",
+			Description: "WorkBuddy 各账号剩余积分(JSON,需管理鉴权)",
 		}},
 		Resources: []pluginapi.ResourceRoute{{
 			Path:        quotaResourcePath,
 			Menu:        quotaMenuName(),
-			Description: "每个 workbuddy 账号的剩余积分（浏览器可直接打开）",
+			Description: "每个 WorkBuddy 账号的剩余积分（浏览器可直接打开）",
 		}},
 	})
 }
@@ -68,12 +68,12 @@ func handleManagementRegister(raw []byte) ([]byte, error) {
 // CN and Global ship as two separate plugins (one provider per .so), and both
 // used to register the bare label "额度". The operator then saw two identical
 // menu items with no way to tell which realm a balance belonged to, so the
-// realm is spelled out instead: "workbuddy 额度" vs "workbuddy 国际版额度".
+// realm is spelled out instead: "WorkBuddy 额度" vs "WorkBuddy 国际版额度".
 func quotaMenuName() string {
 	if normalizeRegion(buildRegion) == regionGlobal {
-		return "workbuddy 国际版额度"
+		return "WorkBuddy 国际版额度"
 	}
-	return "workbuddy 额度"
+	return "WorkBuddy 额度"
 }
 
 // quotaPageTitle is the heading of the balance page. It matches the menu entry
@@ -146,7 +146,7 @@ func renderQuotaHTML(snapshot quotaSnapshot, masked bool) string {
 		b.WriteString(`<p class="err">` + html.EscapeString(snapshot.Error) + `</p>`)
 	}
 	if len(snapshot.Accounts) == 0 && snapshot.Error == "" {
-		b.WriteString(`<p class="empty">还没有 workbuddy 凭据。先在 CPA 面板登录一个账号。</p>`)
+		b.WriteString(`<p class="empty">还没有 WorkBuddy 凭据。先在 CPA 面板登录一个账号。</p>`)
 	}
 
 	for _, acc := range snapshot.Accounts {

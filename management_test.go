@@ -101,9 +101,9 @@ func TestManagementHandleResourceRendersHTML(t *testing.T) {
 // sidebar entries apart.
 func TestQuotaMenuNameDistinguishesRealms(t *testing.T) {
 	// The realm must follow this binary, not a runtime config value.
-	want := "workbuddy 额度"
+	want := "WorkBuddy 额度"
 	if normalizeRegion(buildRegion) == regionGlobal {
-		want = "workbuddy 国际版额度"
+		want = "WorkBuddy 国际版额度"
 	}
 	if got := quotaMenuName(); got != want {
 		t.Errorf("quotaMenuName() = %q, want %q for buildRegion %q", got, want, buildRegion)

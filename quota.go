@@ -662,7 +662,7 @@ func collectQuota(force bool) quotaSnapshot {
 		return snapshot
 	}
 	if len(auths) == 0 {
-		snapshot.Error = "host 里没有 workbuddy 凭据"
+		snapshot.Error = "host 里没有 WorkBuddy 凭据"
 	}
 
 	accounts := make([]quotaAccount, len(auths))
