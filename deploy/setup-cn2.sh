@@ -11,16 +11,31 @@ INSTALL_DIR=/opt/plugin-deploy
 ENV_FILE="$INSTALL_DIR/plugin-deploy.env"
 REPO_DIR="${REPO_DIR:-$PWD}"
 
+# Accept either a repo checkout (deploy/<file>) or a flat directory of the
+# already-extracted deploy files (scp'd straight into /opt/plugin-deploy).
+if [ -f "$REPO_DIR/deploy/deploy-webhook.py" ]; then
+  SRC_DIR="$REPO_DIR/deploy"
+elif [ -f "$REPO_DIR/deploy-webhook.py" ]; then
+  SRC_DIR="$REPO_DIR"
+else
+  echo "ERROR: deploy-webhook.py not found in $REPO_DIR or $REPO_DIR/deploy" >&2
+  exit 1
+fi
+
 echo "==> creating $INSTALL_DIR"
 mkdir -p "$INSTALL_DIR"
 
 echo "==> installing deploy-webhook.py"
-install -m 0755 "$REPO_DIR/deploy/deploy-webhook.py" "$INSTALL_DIR/deploy-webhook.py"
+if [ "$SRC_DIR" != "$INSTALL_DIR" ]; then
+  install -m 0755 "$SRC_DIR/deploy-webhook.py" "$INSTALL_DIR/deploy-webhook.py"
+else
+  chmod 0755 "$INSTALL_DIR/deploy-webhook.py"
+fi
 
 if [ ! -f "$ENV_FILE" ]; then
   echo "==> creating $ENV_FILE"
-  if [ -f "$REPO_DIR/deploy/plugin-deploy.env.example" ]; then
-    install -m 0600 "$REPO_DIR/deploy/plugin-deploy.env.example" "$ENV_FILE"
+  if [ -f "$SRC_DIR/plugin-deploy.env.example" ]; then
+    install -m 0600 "$SRC_DIR/plugin-deploy.env.example" "$ENV_FILE"
     # Generate a secret so the listener refuses to start without one, and so
     # there is a concrete value to paste into the GitHub webhook / CI secret.
     secret=$(python3 -c 'import secrets;print(secrets.token_hex(32))')
@@ -28,7 +43,7 @@ if [ ! -f "$ENV_FILE" ]; then
     rm -f "$ENV_FILE.bak"
     echo "    generated WEBHOOK_SECRET"
   else
-    echo "ERROR: deploy/plugin-deploy.env.example not found in $REPO_DIR" >&2
+    echo "ERROR: deploy/plugin-deploy.env.example not found in $SRC_DIR" >&2
     exit 1
   fi
 else
