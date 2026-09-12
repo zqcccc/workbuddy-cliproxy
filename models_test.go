@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"gopkg.in/yaml.v3"
 )
 
 // TestExtractModelsV3Config uses the exact schema CodeBuddy serves (same field
@@ -281,5 +282,308 @@ func TestFallbackModels(t *testing.T) {
 		if m.ID == "" || m.OwnedBy != providerName || m.Object != "model" {
 			t.Errorf("model %+v missing required fields", m)
 		}
+	}
+}
+
+// TestExtraModelSpecDecodesBothForms covers the two ways extra_models can be
+// written: a bare id (historical form, takes the defaults) and a mapping that
+// carries the catalog fields so a hidden model gets published with the limits
+// upstream actually enforces.
+func TestExtraModelSpecDecodesBothForms(t *testing.T) {
+	const cfg = `
+extra_models:
+  - hy4-preview-f
+  - id: hy4-preview-x
+    name: Hy4 preview
+    maxInputTokens: 1000000
+    maxOutputTokens: 64000
+    supportsImages: true
+    contextWindow:
+      defaultLength: 200000
+      supportedLengths: [200000, 1000000]
+`
+	var parsed struct {
+		ExtraModels []extraModelSpec `yaml:"extra_models"`
+	}
+	if err := yaml.Unmarshal([]byte(cfg), &parsed); err != nil {
+		t.Fatalf("yaml.Unmarshal: %v", err)
+	}
+	if len(parsed.ExtraModels) != 2 {
+		t.Fatalf("decoded %d entries, want 2", len(parsed.ExtraModels))
+	}
+
+	bare := parsed.ExtraModels[0].upstreamModel
+	// Name stays empty on purpose so the live catalog can supply the real one;
+	// the id is the downstream fallback when nothing provides a name.
+	if bare.ID != "hy4-preview-f" || bare.Name != "" {
+		t.Errorf("bare entry = %+v, want id hy4-preview-f and an empty name", bare)
+	}
+	if bare.MaxInputTokens != 0 || bare.ContextWindow != nil {
+		t.Errorf("bare entry carries metadata: %+v", bare)
+	}
+
+	full := parsed.ExtraModels[1].upstreamModel
+	if full.ID != "hy4-preview-x" || full.Name != "Hy4 preview" {
+		t.Errorf("mapping entry = %+v", full)
+	}
+	if full.MaxInputTokens != 1000000 || full.MaxOutputTokens != 64000 {
+		t.Errorf("mapping limits = %d/%d, want 1000000/64000", full.MaxInputTokens, full.MaxOutputTokens)
+	}
+	if !full.SupportsImages {
+		t.Error("mapping entry lost supportsImages")
+	}
+	if got := full.effectiveContextLength(); got != 200000 {
+		t.Errorf("effectiveContextLength = %d, want the 200000 default window", got)
+	}
+}
+
+// TestAppendExtraModelsUsesConfiguredLimits is the regression this change
+// exists for: the Global realm hides the hy4 family from /v3/config, so its
+// limits can only come from configuration. A configured entry must publish the
+// real output cap and the default window instead of the 200000/8192 defaults.
+func TestAppendExtraModelsUsesConfiguredLimits(t *testing.T) {
+	restore := configuredExtraModels()
+	t.Cleanup(func() { setConfiguredExtraModelsForTest(restore) })
+
+	base := []pluginapi.ModelInfo{{ID: "hy3", ContextLength: 192000}}
+	setConfiguredExtraModelsForTest([]extraModelSpec{
+		{upstreamModel{ID: "hy4-preview-f", Name: "hy4-preview-f"}},
+		{upstreamModel{
+			ID:              "hy4-preview-x",
+			Name:            "Hy4 preview",
+			MaxInputTokens:  1000000,
+			MaxOutputTokens: 64000,
+			ContextWindow:   &contextWindow{DefaultLength: 200000, SupportedLengths: []int64{200000, 1000000}},
+		}},
+	})
+
+	byID := map[string]pluginapi.ModelInfo{}
+	for _, m := range appendExtraModels(base, nil) {
+		byID[m.ID] = m
+	}
+
+	// No live catalog, but the id is one whose limits were measured off the
+	// real API, so those win over the generic defaults.
+	if got := byID["hy4-preview-f"].ContextLength; got != 1000000 {
+		t.Errorf("bare hy4-preview-f ContextLength = %d, want the measured 1000000", got)
+	}
+	if got := byID["hy4-preview-f"].MaxCompletionTokens; got != 64000 {
+		t.Errorf("bare hy4-preview-f MaxCompletionTokens = %d, want the measured 64000", got)
+	}
+
+	// Configured entry: real limits reach the client.
+	full := byID["hy4-preview-x"]
+	if full.MaxCompletionTokens != 64000 {
+		t.Errorf("hy4-preview-x MaxCompletionTokens = %d, want 64000", full.MaxCompletionTokens)
+	}
+	if full.ContextLength != 200000 {
+		t.Errorf("hy4-preview-x ContextLength = %d, want the 200000 default window", full.ContextLength)
+	}
+	if full.SupportedInputModalities[0] != "text" {
+		t.Errorf("hy4-preview-x modalities = %v", full.SupportedInputModalities)
+	}
+	if full.DisplayName != "Hy4 preview" {
+		t.Errorf("hy4-preview-x DisplayName = %q", full.DisplayName)
+	}
+}
+
+// TestAppendExtraModelsFillsFromLiveCatalog is the behaviour this change
+// exists for: a bare configured id must pick up the limits the live catalog
+// reports, on every refresh, instead of keeping the 200000/8192 defaults. That
+// is what keeps the published numbers equal to the ones the console API shows.
+func TestAppendExtraModelsFillsFromLiveCatalog(t *testing.T) {
+	restore := configuredExtraModels()
+	t.Cleanup(func() { setConfiguredExtraModelsForTest(restore) })
+
+	// What the console API returns for the Global realm today.
+	live := []upstreamModel{{
+		ID:              "hy4-preview",
+		Name:            "Hy4 preview",
+		MaxInputTokens:  1000000,
+		MaxOutputTokens: 64000,
+		SupportsImages:  true,
+		ContextWindow:   &contextWindow{DefaultLength: 200000, SupportedLengths: []int64{200000, 1000000}},
+	}}
+
+	// Configured as bare ids, the way every existing deployment has them.
+	setConfiguredExtraModelsForTest(extraIDs("hy4-preview"))
+
+	byID := map[string]pluginapi.ModelInfo{}
+	for _, m := range appendExtraModels(nil, live) {
+		byID[m.ID] = m
+	}
+	got := byID["hy4-preview"]
+
+	// Real output cap, not the 8192 default.
+	if got.MaxCompletionTokens != 64000 {
+		t.Errorf("MaxCompletionTokens = %d, want 64000 from the live catalog", got.MaxCompletionTokens)
+	}
+	// The default window, resolved the same way a discovered model would be.
+	if got.ContextLength != 200000 {
+		t.Errorf("ContextLength = %d, want the 200000 default window", got.ContextLength)
+	}
+	if got.DisplayName != "Hy4 preview" {
+		t.Errorf("DisplayName = %q, want the live name", got.DisplayName)
+	}
+	if len(got.SupportedInputModalities) != 2 || got.SupportedInputModalities[1] != "image" {
+		t.Errorf("modalities = %v, want text+image", got.SupportedInputModalities)
+	}
+}
+
+// TestAppendExtraModelsConfigWinsOverLive keeps an explicit override winning:
+// an operator who pins a number is stating a fact about their deployment, so
+// the live value must not clobber it.
+func TestAppendExtraModelsConfigWinsOverLive(t *testing.T) {
+	restore := configuredExtraModels()
+	t.Cleanup(func() { setConfiguredExtraModelsForTest(restore) })
+
+	live := []upstreamModel{{
+		ID:              "hy4-preview",
+		MaxInputTokens:  1000000,
+		MaxOutputTokens: 64000,
+		ContextWindow:   &contextWindow{DefaultLength: 200000, SupportedLengths: []int64{200000, 1000000}},
+	}}
+	setConfiguredExtraModelsForTest([]extraModelSpec{{upstreamModel{
+		ID:              "hy4-preview",
+		MaxInputTokens:  1000000,
+		MaxOutputTokens: 32000, // deliberate cap below upstream
+		ContextWindow:   &contextWindow{DefaultLength: 1000000, SupportedLengths: []int64{200000, 1000000}},
+	}}})
+
+	byID := map[string]pluginapi.ModelInfo{}
+	for _, m := range appendExtraModels(nil, live) {
+		byID[m.ID] = m
+	}
+	got := byID["hy4-preview"]
+	if got.MaxCompletionTokens != 32000 {
+		t.Errorf("MaxCompletionTokens = %d, want the configured 32000", got.MaxCompletionTokens)
+	}
+	if got.ContextLength != 1000000 {
+		t.Errorf("ContextLength = %d, want the configured 1000000 window", got.ContextLength)
+	}
+}
+
+// TestMergeCatalogsKeepsBothSides covers why both endpoints are fetched: each
+// lists models the other omits, so reading only one silently drops models the
+// account can serve.
+func TestMergeCatalogsKeepsBothSides(t *testing.T) {
+	console := []upstreamModel{
+		{ID: "hy4-preview-x", MaxInputTokens: 1000000, MaxOutputTokens: 64000},
+		{ID: "hy3", MaxInputTokens: 192000, MaxOutputTokens: 64000},
+	}
+	v3 := []upstreamModel{
+		{ID: "hy4-preview-f", MaxInputTokens: 1000000, MaxOutputTokens: 64000},
+		// Same id, but no contextWindow: the console entry is richer and wins.
+		{ID: "hy3", MaxInputTokens: 192000, MaxOutputTokens: 64000},
+	}
+
+	byID := map[string]upstreamModel{}
+	for _, m := range mergeCatalogs(console, v3) {
+		byID[m.ID] = m
+	}
+	if len(byID) != 3 {
+		t.Fatalf("merged %d models, want 3", len(byID))
+	}
+	for _, id := range []string{"hy4-preview-x", "hy4-preview-f", "hy3"} {
+		if _, ok := byID[id]; !ok {
+			t.Errorf("merge lost %q", id)
+		}
+	}
+}
+
+// TestMergeCatalogsPrefersContextWindow guards the tie-break: when both sides
+// describe an id, the one carrying the selectable budget wins, because a bare
+// entry would fall back to the built-in defaults.
+func TestMergeCatalogsPrefersContextWindow(t *testing.T) {
+	console := []upstreamModel{{
+		ID:              "hy4-preview",
+		MaxInputTokens:  1000000,
+		MaxOutputTokens: 64000,
+		ContextWindow:   &contextWindow{DefaultLength: 200000, SupportedLengths: []int64{200000, 1000000}},
+	}}
+	v3 := []upstreamModel{{ID: "hy4-preview", MaxInputTokens: 1000000, MaxOutputTokens: 64000}}
+
+	merged := mergeCatalogs(console, v3)
+	if len(merged) != 1 {
+		t.Fatalf("merged %d, want 1", len(merged))
+	}
+	if merged[0].ContextWindow == nil {
+		t.Error("merge dropped the contextWindow from the console entry")
+	}
+	// Order must not matter: the richer entry wins either way.
+	if other := mergeCatalogs(v3, console); len(other) == 1 && other[0].ContextWindow == nil {
+		t.Error("merge is order-dependent: reversed input lost the contextWindow")
+	}
+}
+
+// TestMeasuredValuesMatchLiveAPI is a tripwire against the hardcoded table
+// drifting from reality: if the upstream numbers change, these fail and the
+// table gets revisited instead of silently serving stale limits.
+func TestMeasuredValuesMatchLiveAPI(t *testing.T) {
+	cases := []struct {
+		id           string
+		wantInput    int64
+		wantOutput   int64
+		wantCtx      int64
+		wantSupports bool
+	}{
+		// hy4-preview: only id carrying a selectable budget, so it resolves to
+		// the 200000 default window rather than the 1M hard cap.
+		{"hy4-preview", 1000000, 64000, 200000, true},
+		{"hy4-preview-f", 1000000, 64000, 1000000, true},
+		{"hy4-preview-x", 1000000, 64000, 1000000, true},
+	}
+	setConfiguredExtraModelsForTest(nil)
+	defer setConfiguredExtraModelsForTest(nil)
+
+	var ids []string
+	for _, c := range cases {
+		ids = append(ids, c.id)
+	}
+	// Empty catalog: forces the measured table to be the only source.
+	setConfiguredExtraModelsForTest(extraIDs(ids...))
+	byID := map[string]pluginapi.ModelInfo{}
+	for _, m := range appendExtraModels(nil, nil) {
+		byID[m.ID] = m
+	}
+	for _, c := range cases {
+		got, ok := byID[c.id]
+		if !ok {
+			t.Errorf("%s missing from published list", c.id)
+			continue
+		}
+		if got.ContextLength != c.wantCtx {
+			t.Errorf("%s ContextLength = %d, want %d", c.id, got.ContextLength, c.wantCtx)
+		}
+		if got.MaxCompletionTokens != c.wantOutput {
+			t.Errorf("%s MaxCompletionTokens = %d, want %d", c.id, got.MaxCompletionTokens, c.wantOutput)
+		}
+		if len(got.SupportedInputModalities) < 2 && c.wantSupports {
+			t.Errorf("%s modalities = %v, want text+image", c.id, got.SupportedInputModalities)
+		}
+	}
+}
+
+// TestLiveCatalogBeatsMeasuredTable pins the precedence: a live catalog entry
+// is fresher than the baked-in measurement and must win.
+func TestLiveCatalogBeatsMeasuredTable(t *testing.T) {
+	setConfiguredExtraModelsForTest(extraIDs("hy4-preview"))
+	defer setConfiguredExtraModelsForTest(nil)
+
+	live := []upstreamModel{{
+		ID:              "hy4-preview",
+		Name:            "Hy4 preview",
+		MaxInputTokens:  500000, // upstream revised its limits downward
+		MaxOutputTokens: 32000,
+	}}
+
+	byID := map[string]pluginapi.ModelInfo{}
+	for _, m := range appendExtraModels(nil, live) {
+		byID[m.ID] = m
+	}
+	got := byID["hy4-preview"]
+	if got.ContextLength != 500000 || got.MaxCompletionTokens != 32000 {
+		t.Errorf("got ctx=%d out=%d, want the live 500000/32000 to override the measured table",
+			got.ContextLength, got.MaxCompletionTokens)
 	}
 }

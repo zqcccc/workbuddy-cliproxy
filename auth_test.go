@@ -313,10 +313,19 @@ func TestProviderNameIsValidPluginID(t *testing.T) {
 	}
 }
 
-func setConfiguredExtraModelsForTest(v []string) {
+func setConfiguredExtraModelsForTest(v []extraModelSpec) {
 	cfgMu.Lock()
 	defer cfgMu.Unlock()
 	cfgExtraModels = v
+}
+
+// extraIDs builds a []extraModelSpec from bare ids, the short config form.
+func extraIDs(ids ...string) []extraModelSpec {
+	out := make([]extraModelSpec, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, extraModelSpec{upstreamModel{ID: id}})
+	}
+	return out
 }
 
 func TestAppendExtraModels(t *testing.T) {
@@ -327,13 +336,13 @@ func TestAppendExtraModels(t *testing.T) {
 
 	// Nothing configured: the discovered list is returned untouched.
 	setConfiguredExtraModelsForTest(nil)
-	if got := appendExtraModels(base); len(got) != 2 {
+	if got := appendExtraModels(base, nil); len(got) != 2 {
 		t.Fatalf("len = %d, want 2", len(got))
 	}
 
 	// Configured ids are appended; ids already discovered are not duplicated.
-	setConfiguredExtraModelsForTest([]string{"hy4-preview-f", "hy4-preview-x", "hy3", "  "})
-	got := appendExtraModels(base)
+	setConfiguredExtraModelsForTest(extraIDs("hy4-preview-f", "hy4-preview-x", "hy3", "  "))
+	got := appendExtraModels(base, nil)
 	if len(got) != 4 {
 		t.Fatalf("len = %d, want 4 (2 existing + 2 new)", len(got))
 	}
@@ -347,8 +356,8 @@ func TestAppendExtraModels(t *testing.T) {
 		}
 	}
 	// Service models are never advertised, even when configured.
-	setConfiguredExtraModelsForTest([]string{"completion-1.0"})
-	if got := appendExtraModels(base); len(got) != 2 {
+	setConfiguredExtraModelsForTest(extraIDs("completion-1.0"))
+	if got := appendExtraModels(base, nil); len(got) != 2 {
 		t.Fatalf("service model was added: %d", len(got))
 	}
 }

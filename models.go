@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"gopkg.in/yaml.v3"
 )
 
 const (
@@ -31,21 +32,23 @@ const (
 
 // upstreamModel mirrors one entry of the CodeBuddy model catalog. Field names
 // match the schema served by /v3/config and bundled in product-ide-cn.json.
+// The yaml tags let the same shape be written in a plugin config block, so
+// extra_models entries can carry real limits instead of taking the defaults.
 type upstreamModel struct {
-	ID                string         `json:"id"`
-	Name              string         `json:"name"`
-	Vendor            string         `json:"vendor"`
-	DescriptionZh     string         `json:"descriptionZh"`
-	DescriptionEn     string         `json:"descriptionEn"`
-	ContextWindow     *contextWindow `json:"contextWindow"`
-	MaxAllowedSize    int64          `json:"maxAllowedSize"`
-	MaxInputTokens    int64          `json:"maxInputTokens"`
-	MaxOutputTokens   int64          `json:"maxOutputTokens"`
-	SupportsToolCall  bool           `json:"supportsToolCall"`
-	SupportsImages    bool           `json:"supportsImages"`
-	SupportsReasoning bool           `json:"supportsReasoning"`
-	OnlyReasoning     bool           `json:"onlyReasoning"`
-	IsDefault         bool           `json:"isDefault"`
+	ID                string         `json:"id" yaml:"id"`
+	Name              string         `json:"name" yaml:"name"`
+	Vendor            string         `json:"vendor" yaml:"vendor"`
+	DescriptionZh     string         `json:"descriptionZh" yaml:"descriptionZh"`
+	DescriptionEn     string         `json:"descriptionEn" yaml:"descriptionEn"`
+	ContextWindow     *contextWindow `json:"contextWindow" yaml:"contextWindow"`
+	MaxAllowedSize    int64          `json:"maxAllowedSize" yaml:"maxAllowedSize"`
+	MaxInputTokens    int64          `json:"maxInputTokens" yaml:"maxInputTokens"`
+	MaxOutputTokens   int64          `json:"maxOutputTokens" yaml:"maxOutputTokens"`
+	SupportsToolCall  bool           `json:"supportsToolCall" yaml:"supportsToolCall"`
+	SupportsImages    bool           `json:"supportsImages" yaml:"supportsImages"`
+	SupportsReasoning bool           `json:"supportsReasoning" yaml:"supportsReasoning"`
+	OnlyReasoning     bool           `json:"onlyReasoning" yaml:"onlyReasoning"`
+	IsDefault         bool           `json:"isDefault" yaml:"isDefault"`
 }
 
 // contextWindow is the newer selectable context-budget block the catalog
@@ -61,8 +64,50 @@ type upstreamModel struct {
 // the hard cap instead makes downstream clients (Claude Code, Cline, ...) pack
 // prompts the account cannot actually serve, so mirror the CLI's resolution.
 type contextWindow struct {
-	DefaultLength    int64   `json:"defaultLength"`
-	SupportedLengths []int64 `json:"supportedLengths"`
+	DefaultLength    int64   `json:"defaultLength" yaml:"defaultLength"`
+	SupportedLengths []int64 `json:"supportedLengths" yaml:"supportedLengths"`
+}
+
+// extraModelSpec is one entry of the plugins.configs.<id>.extra_models list.
+// It decodes from either a bare id string or an object shaped like an upstream
+// catalog entry, so an operator can publish a model the catalog omits with its
+// real limits attached:
+//
+//	extra_models:
+//	  - hy4-preview-f
+//	  - id: hy4-preview-x
+//	    maxInputTokens: 1000000
+//	    maxOutputTokens: 64000
+//	    contextWindow: {defaultLength: 200000, supportedLengths: [200000, 1000000]}
+type extraModelSpec struct {
+	upstreamModel
+}
+
+// UnmarshalYAML accepts both spellings. A scalar is an id with no metadata and
+// keeps the historical behaviour (defaults for context and output length); a
+// mapping is decoded as a catalog entry, so it flows through the same
+// effectiveContextLength resolution as a discovered model.
+func (s *extraModelSpec) UnmarshalYAML(value *yaml.Node) error {
+	var id string
+	if err := value.Decode(&id); err == nil {
+		trimmed := strings.TrimSpace(id)
+		if trimmed != "" {
+			// Name is deliberately left empty: it is not operator input, so the
+			// live catalog may still supply the real display name. The id is used
+			// as the fallback downstream when nothing else provides one.
+			s.upstreamModel = upstreamModel{ID: trimmed}
+		}
+		return nil
+	}
+	var m upstreamModel
+	if err := value.Decode(&m); err != nil {
+		return err
+	}
+	if m.Name == "" {
+		m.Name = m.ID
+	}
+	s.upstreamModel = m
+	return nil
 }
 
 // serviceModelPrefixes are internal, non-conversational models that CodeBuddy
@@ -89,34 +134,105 @@ type v3ConfigData struct {
 // Discovery
 // -----------------------------------------------------------------------------
 
-// fetchRemoteModels asks CodeBuddy which models the account may use. It prefers
-// /v3/config and falls back to the legacy console catalog when that endpoint is
-// not routed or yields nothing usable.
+// fetchRemoteModels asks CodeBuddy which models the account may use. Both
+// catalogs are fetched and merged, because each one lists models the other
+// omits: /v3/config has hy4-preview-f but not hy4-preview-x, while the console
+// catalog has hy4-preview-x, auto and the selectable contextWindow block but
+// not hy4-preview-f. Neither is a superset, so a single source silently drops
+// models the account can serve.
 func fetchRemoteModels(sa *storedAuth) ([]upstreamModel, error) {
 	headers := func(r *http.Request) { backendHeaders(r, sa) }
 	base := baseFor(sa.Region)
+	client := discoveryHTTPClient()
 
-	// /v3/config is the current catalog. An anonymous caller gets models:null,
-	// so an empty list is treated the same as a failure and falls through.
-	primaryErr := fmt.Errorf("v3/config: no model list")
-	if data, _, err := doJSON(discoveryHTTPClient(), http.MethodGet, base+pathConfigV3, headers, nil); err == nil {
-		if models := extractModels(data); len(models) > 0 {
-			return models, nil
+	v3, v3Err := fetchCatalog(client, http.MethodGet, base+pathConfigV3, headers)
+	console, consoleErr := fetchCatalog(client, http.MethodGet, base+pathConsoleModels, headers)
+
+	if len(v3) == 0 && len(console) == 0 {
+		// Nothing usable at all. Report why, so the log says what to fix.
+		if v3Err != nil && consoleErr != nil {
+			return nil, fmt.Errorf("v3/config: %w; console/models: %w", v3Err, consoleErr)
 		}
-	} else {
-		primaryErr = fmt.Errorf("v3/config: %w", err)
+		if v3Err != nil {
+			return nil, fmt.Errorf("v3/config: %w; console/models: empty model list", v3Err)
+		}
+		if consoleErr != nil {
+			return nil, fmt.Errorf("v3/config: empty model list; console/models: %w", consoleErr)
+		}
+		return nil, fmt.Errorf("v3/config and console/models both returned an empty model list")
 	}
 
-	// Legacy console catalog, still the most widely routed one.
-	data, _, err := doJSON(discoveryHTTPClient(), http.MethodGet, base+pathConsoleModels, headers, nil)
+	return mergeCatalogs(console, v3), nil
+}
+
+// fetchCatalog fetches one catalog endpoint and extracts its model list. A
+// failure is returned alongside a nil list so the caller can merge whatever
+// the other endpoint produced.
+func fetchCatalog(client *http.Client, method, url string, headers func(*http.Request)) ([]upstreamModel, error) {
+	data, _, err := doJSON(client, method, url, headers, nil)
 	if err != nil {
-		return nil, fmt.Errorf("%v; console/models: %w", primaryErr, err)
+		return nil, err
 	}
 	models := extractModels(data)
 	if len(models) == 0 {
-		return nil, fmt.Errorf("%v; console/models: empty model list", primaryErr)
+		return nil, fmt.Errorf("empty model list")
 	}
 	return models, nil
+}
+
+// mergeCatalogs combines two catalogs, preferring the richer entry when both
+// describe the same id. The console catalog wins because it is the one that
+// carries contextWindow; /v3/config still contributes ids it lists alone.
+func mergeCatalogs(console, v3 []upstreamModel) []upstreamModel {
+	byID := make(map[string]upstreamModel, len(console)+len(v3))
+	order := make([]string, 0, len(console)+len(v3))
+	for _, list := range [][]upstreamModel{console, v3} {
+		for _, m := range list {
+			id := strings.TrimSpace(m.ID)
+			if id == "" {
+				continue
+			}
+			existing, seen := byID[id]
+			if !seen {
+				order = append(order, id)
+				byID[id] = m
+				continue
+			}
+			if !seen || richerModel(m, existing) {
+				byID[id] = m
+			}
+		}
+	}
+	out := make([]upstreamModel, 0, len(order))
+	for _, id := range order {
+		out = append(out, byID[id])
+	}
+	return out
+}
+
+// richerModel reports whether candidate carries more usable metadata than
+// current. More fields means a better entry: an entry with a contextWindow or
+// a non-zero input cap beats a bare id, since a bare id would fall back to the
+// built-in defaults.
+func richerModel(candidate, current upstreamModel) bool {
+	return modelScore(candidate) > modelScore(current)
+}
+
+func modelScore(m upstreamModel) int {
+	score := 0
+	if m.ContextWindow != nil {
+		score += 8
+	}
+	if m.MaxInputTokens > 0 {
+		score += 4
+	}
+	if m.MaxOutputTokens > 0 {
+		score += 2
+	}
+	if strings.TrimSpace(m.Name) != "" && strings.TrimSpace(m.Name) != m.ID {
+		score++
+	}
+	return score
 }
 
 // discoveryHTTPClient is a short-timeout client so a slow catalog endpoint can
@@ -426,7 +542,7 @@ func modelsForAuth(req pluginapi.AuthModelRequest, sa *storedAuth) []pluginapi.M
 		})
 		return fallbackModels()
 	}
-	models := appendExtraModels(toModelInfos(remote))
+	models := appendExtraModels(toModelInfos(remote), remote)
 	modelCacheStore(key, models)
 	hostLog("info", "workbuddy: model discovery succeeded", map[string]any{
 		"uid":   sa.Account.UID,
@@ -435,13 +551,20 @@ func modelsForAuth(req pluginapi.AuthModelRequest, sa *storedAuth) []pluginapi.M
 	return models
 }
 
-// appendExtraModels adds the ids configured under plugins.configs.<id>.
+// appendExtraModels adds the entries configured under plugins.configs.<id>.
 // extra_models. Upstream catalogs are not always complete: the Global realm
 // serves the hy4 family but leaves it out of /v3/config, and the endpoint that
-// does list it is browser-session only. Entries already present upstream are
-// skipped so a discovered model keeps its real metadata instead of being
-// replaced by these defaults.
-func appendExtraModels(models []pluginapi.ModelInfo) []pluginapi.ModelInfo {
+// does list it (console/models) answers 500 there with a Bearer token.
+// Entries already present in the discovered catalog are skipped so they keep
+// their real metadata.
+//
+// Each entry is either a bare id or an object carrying catalog fields. Any
+// field the entry leaves out is filled from remote, the catalog this account
+// just fetched, so a configured model tracks the live upstream numbers instead
+// of the built-in defaults. A bare id that upstream has since started
+// advertising therefore picks up its real limits on the next refresh; the
+// defaults only apply to ids no source describes at all.
+func appendExtraModels(models []pluginapi.ModelInfo, remote []upstreamModel) []pluginapi.ModelInfo {
 	extra := configuredExtraModels()
 	if len(extra) == 0 {
 		return models
@@ -450,10 +573,16 @@ func appendExtraModels(models []pluginapi.ModelInfo) []pluginapi.ModelInfo {
 	for _, m := range models {
 		seen[m.ID] = struct{}{}
 	}
-	out := models
-	added := 0
-	for _, raw := range extra {
-		id := strings.TrimSpace(raw)
+	byID := make(map[string]upstreamModel, len(remote))
+	for _, m := range remote {
+		byID[strings.TrimSpace(m.ID)] = m
+	}
+
+	var pending []upstreamModel
+	var unresolved []string
+	for _, spec := range extra {
+		m := spec.upstreamModel
+		id := strings.TrimSpace(m.ID)
 		if id == "" || isServiceModel(id) {
 			continue
 		}
@@ -461,25 +590,108 @@ func appendExtraModels(models []pluginapi.ModelInfo) []pluginapi.ModelInfo {
 			continue
 		}
 		seen[id] = struct{}{}
-		out = append(out, pluginapi.ModelInfo{
-			ID:                         id,
-			Object:                     "model",
-			OwnedBy:                    providerName,
-			DisplayName:                id,
-			Name:                       id,
-			SupportedGenerationMethods: []string{"chat"},
-			ContextLength:              defaultContextLength,
-			MaxCompletionTokens:        defaultMaxCompletion,
-			SupportedInputModalities:   []string{"text"},
-			SupportedOutputModalities:  []string{"text"},
-			UserDefined:                true,
-		})
-		added++
+		m.ID = id
+		// fillFromCatalog only fills fields the config left empty, so an
+		// explicit value in the plugin config still wins over both sources.
+		switch live, ok := byID[id]; {
+		case ok:
+			// Preferred source: what this account's catalog just returned.
+			m = fillFromCatalog(m, live)
+		default:
+			// No reachable endpoint described it. Fall back to the numbers
+			// measured off the real API rather than the generic defaults.
+			if measured, ok := measuredModels[id]; ok {
+				m = fillFromCatalog(m, measured)
+			} else {
+				unresolved = append(unresolved, id)
+			}
+		}
+		if m.Name == "" {
+			m.Name = id
+		}
+		pending = append(pending, m)
 	}
-	if added > 0 {
-		hostLog("info", "workbuddy: added configured extra models", map[string]any{"count": added})
+	if len(pending) == 0 {
+		return models
 	}
-	return out
+	added := toModelInfos(pending)
+	fields := map[string]any{"count": len(added)}
+	if len(unresolved) > 0 {
+		// No source described these, so they take the built-in defaults.
+		fields["defaultsFor"] = unresolved
+	}
+	hostLog("info", "workbuddy: added configured extra models", fields)
+	return append(models, added...)
+}
+
+// fillFromCatalog copies any field the configured entry left empty from the
+// live catalog entry for the same id. Explicit config still wins: an operator
+// who writes maxInputTokens overrides the upstream number rather than being
+// ignored. Name is only taken when the entry has none, so a configured display
+// name survives.
+func fillFromCatalog(entry, live upstreamModel) upstreamModel {
+	if entry.Name == "" {
+		entry.Name = live.Name
+	}
+	if entry.ContextWindow == nil {
+		entry.ContextWindow = live.ContextWindow
+	}
+	if entry.MaxInputTokens <= 0 {
+		entry.MaxInputTokens = live.MaxInputTokens
+	}
+	if entry.MaxOutputTokens <= 0 {
+		entry.MaxOutputTokens = live.MaxOutputTokens
+	}
+	if entry.DescriptionZh == "" {
+		entry.DescriptionZh = live.DescriptionZh
+	}
+	if entry.DescriptionEn == "" {
+		entry.DescriptionEn = live.DescriptionEn
+	}
+	entry.SupportsImages = entry.SupportsImages || live.SupportsImages
+	entry.SupportsReasoning = entry.SupportsReasoning || live.SupportsReasoning
+	entry.SupportsToolCall = entry.SupportsToolCall || live.SupportsToolCall
+	return entry
+}
+
+// measuredModels records limits read off the real catalog endpoints, so a
+// model no reachable endpoint describes still gets its true numbers instead
+// of the generic defaults. Every value here was observed on a live response;
+// the source is recorded next to it because these can drift.
+//
+// The hy4 family is why this exists:
+//   - Global /v3/config omits all three ids (verified: 35 models, only hy3),
+//     and the console catalog that does list them needs a browser cookie the
+//     plugin does not hold, so at runtime Global only sees /v3/config.
+//   - CN /v3/config does carry them, but which ids appear varies per account
+//     (one account showed -f, another -x), so no single account sees all.
+//
+// hy4-preview also sells a selectable budget: the account can use 1M, but the
+// platform bills and enforces 200000 unless a session picks the larger window,
+// so 200000 is what gets advertised, matching the CodeBuddy CLI.
+var measuredModels = map[string]upstreamModel{
+	"hy4-preview": {
+		ID: "hy4-preview", Name: "Hy4 preview",
+		MaxInputTokens:    1000000,
+		MaxOutputTokens:   64000,
+		SupportsImages:    true,
+		SupportsReasoning: true,
+		ContextWindow:     &contextWindow{DefaultLength: 200000, SupportedLengths: []int64{200000, 1000000}},
+	}, // source: Global console catalog, 200 via browser cookie, 2026-09-12
+	"hy4-preview-f": {
+		ID: "hy4-preview-f", Name: "Hy4 preview",
+		MaxInputTokens:    1000000,
+		MaxOutputTokens:   64000,
+		SupportsImages:    true,
+		SupportsReasoning: true,
+	}, // source: CN /v3/config, account 98e520f0, 2026-09-12
+	"hy4-preview-x": {
+		ID: "hy4-preview-x", Name: "Hy4 preview",
+		MaxInputTokens:    1000000,
+		MaxOutputTokens:   64000,
+		SupportsImages:    true,
+		SupportsReasoning: true,
+	}, // source: CN /v3/config, account 0fd66171, 2026-09-12
 }
 
 // fallbackModels is the bundled catalog used for model.static (no credentials

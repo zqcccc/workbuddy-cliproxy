@@ -103,10 +103,27 @@ plugins:
 1. `GET https://copilot.tencent.com/v3/config` —— 每个 CodeBuddy 客户端启动时拉的远程配置,
    `data.models` 就是该账号有权使用的模型目录(带 `maxInputTokens` / `maxOutputTokens` /
    `supportsImages` 等 serving 字段)。
-2. 拿不到时退回旧接口 `GET /console/enterprises/personal/models`。
+2. `GET /console/enterprises/personal/models` —— 控制台目录。**两个接口都拉,然后合并**,因为
+   各自都列了对方没有的模型:`/v3/config` 有 `hy4-preview-f` 但没有 `hy4-preview-x`,
+   控制台有 `hy4-preview-x` / `auto` 且是唯一带 `contextWindow` 可选预算的那个。
+   谁都不是对方超集,只读一个会静默丢掉账号其实能用的模型。
 3. 都失败(网络不通 / token 失效 / 上游改结构)才用内置兜底列表:
    `default-model` · `auto-chat` · `glm-5v-turbo` · `kimi-k2.5` · `deepseek-v3.2` ·
    `gpt-5.5` · `gemini-3.5-flash`
+
+合并时同一 id 取**信息更全**的那条(带 `contextWindow` 的赢),顺序不敏感。
+
+国际版注意:**控制台接口在国际版只认浏览器 session cookie,不认 Bearer**。
+
+- 带 Bearer(插件运行时的认证方式) → 固定 **500**,换 UA / 换 header 组合都无效。
+- 带浏览器 cookie(`session` + `session_2` 两个成对,缺一不可;UA 还得是
+  `Chrome/152` 那一档) → **200**,实测 29648 字节、18 个模型。
+- 国内版(`copilot.tencent.com`)宽容得多:**带 Bearer 直接 200**,无需 cookie。
+
+插件 OAuth 登录走的是 `/v2/plugin/auth/state`(实测**不下发** session cookie,登录由用户在
+浏览器完成),所以运行时手里只有 Bearer —— 国际版这条控制台接口因此拿不到。想让国际版也吃到
+控制台数据,得把浏览器的 `session` / `session_2` 喂进来(会过期,需手动续),或者等上游把 hy4
+加进 `/v3/config`。在此之前国际版 hy4 只能靠 `extra_models` 显式声明,见下节。
 
 结果按账号缓存 30 分钟。发现失败会走 `host.log` 打一条 `warn`,在 CPA 日志里能看到原因。
 
@@ -166,6 +183,59 @@ suggestion、提示词增强,不能走 chat completions)。
 
 规则:已在上游目录里的 id 不会重复添加(保留上游的真实元数据);`completion-` / `nes-` /
 `enhance-` 这些内部模型配了也会被忽略。
+
+#### 裸 id 的元数据从哪来:优先用接口,不是默认值
+
+裸 id **不等于**用默认值。每次刷新目录时,插件会把裸 id 缺的字段用刚拉到的实时目录补上
+(`fillFromCatalog`),所以接口怎么返回,对外就报什么 —— 上游哪天把 hy4 加进目录、或者改了
+`maxOutputTokens`,下个 30 分钟刷新周期自动跟上,不用改配置。
+
+只有**接口里也没有**这个 id 时,才退回默认值(上下文 200000、输出 8192),并且会在
+`host.log` 里记一条 `defaultsFor: [...]`,方便你看出哪几个 id 没对上。
+
+已用真实账号验证:
+
+国内(控制台接口带 Bearer,200,30 个模型):
+
+```
+hy4-preview     ctx=1000000  out=64000   (接口值)
+hy4-preview-x   ctx=1000000  out=64000   (接口值,经 extra_models 补进目录)
+hy3             ctx=192000   out=64000
+```
+
+国际(浏览器 cookie,200,18 个模型):
+
+```
+hy4-preview   in=1000000  out=64000
+              contextWindow: {defaultLength: 200000, supportedLengths: [200000, 1000000]}
+hy3           in=192000   out=64000
+```
+
+注意国际版控制台目录**只列了 `hy4-preview`**,`-f` / `-x` 没有 —— 这两个的真实上限目前
+**没有任何接口能证实**,只能按 `hy4-preview` 推断,推断值请显式写进配置而不要当实测。
+
+对比改动前:hy4 全部报 `ctx=200000 / out=8192` —— 8192 是插件的兜底常量,不是上游限制。
+
+#### 要写死某个值时:对象写法
+
+想覆盖接口给的数字(比如上游标 64000 但你这账户实测撑不住),写成对象。显式写的字段**优先于**
+接口值,不会被实时数据冲掉:
+
+```yaml
+      extra_models:
+        - hy4-preview-f                 # 裸 id:跟随接口
+        - id: hy4-preview-x             # 对象:只覆盖写出来的字段,其余仍跟随接口
+          name: Hy4 preview
+          maxOutputTokens: 32000        # 刻意压低
+          contextWindow:
+            defaultLength: 1000000
+            supportedLengths: [200000, 1000000]
+```
+
+对象写法走的还是 `toModelInfos`,所以「上下文窗口怎么算」那套(`defaultLength` 优先、永不超过
+`maxInputTokens`)对它一样生效。上面这个例子对外报 **1000000**;裸 id 跟接口走则报 200000
+(因为接口给的 `defaultLength` 就是 200000)。**往上调之前先确认上游收得下**,否则客户端按 1M
+装 prompt 会被拒。
 
 顺带一个观察到的现象:**同一个 OAuth token 打国内域名 `copilot.tencent.com/v3/config` 也能
 通**,而且返回 29 个模型、含 hy4 —— 但这个列表是按国内目录给的,里面有些 id(比如

@@ -146,7 +146,17 @@ type pluginConfig struct {
 	// (/console/enterprises/personal/models) only authenticates with a browser
 	// session cookie, which a plugin does not have. Listing them here is the
 	// only way to expose them without hardcoding ids in the binary.
-	ExtraModels []string `yaml:"extra_models"`
+	//
+	// An entry is either a bare id string, which takes the default context and
+	// output length, or a mapping carrying the catalog fields, so a model the
+	// catalog hides can still be published with its real limits:
+	//
+	//	  - hy4-preview-f
+	//	  - id: hy4-preview-x
+	//	    maxInputTokens: 1000000
+	//	    maxOutputTokens: 64000
+	//	    contextWindow: {defaultLength: 200000, supportedLengths: [200000, 1000000]}
+	ExtraModels []extraModelSpec `yaml:"extra_models"`
 	// ModelPrefix namespaces this instance's models so a client can ask for one
 	// realm explicitly. The host turns it into "<prefix>/<model>" and strips it
 	// again before selecting an auth, so "global/kimi-k2.5" always resolves to
@@ -158,7 +168,7 @@ type pluginConfig struct {
 var (
 	cfgMu          sync.Mutex
 	cfgRegion      = buildRegion
-	cfgExtraModels []string
+	cfgExtraModels []extraModelSpec
 	cfgModelPrefix string
 )
 
@@ -196,7 +206,7 @@ func configuredRegion() string {
 
 // configuredExtraModels returns operator-supplied model ids that upstream does
 // not advertise but does serve.
-func configuredExtraModels() []string {
+func configuredExtraModels() []extraModelSpec {
 	cfgMu.Lock()
 	defer cfgMu.Unlock()
 	return cfgExtraModels
