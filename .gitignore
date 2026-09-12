@@ -16,4 +16,8 @@ workbuddy.json
 .idea/
 .vscode/
 .workbuddy-ai
+.pi/
 workbuddy-cliproxy
+
+# CI 构建产物目录(build.sh --outdir)
+dist/

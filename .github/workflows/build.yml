@@ -1,0 +1,151 @@
+name: Build plugin
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.goos }}-${{ matrix.goarch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # c-shared plugins need a C toolchain matching the target, so each
+          # arch builds natively on its own runner. Cross-compiling a c-shared
+          # binary is possible but drags in a cross toolchain for no gain here.
+          - goos: linux
+            goarch: amd64
+            runner: ubuntu-24.04
+          - goos: linux
+            goarch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          # go.mod requires go >= 1.26.0; pin a known-good patch release.
+          go-version: '1.26.8'
+          cache: true
+
+      - name: Build both realms
+        env:
+          CGO_ENABLED: '1'
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -euo pipefail
+          ./build.sh
+          ls -l dist/
+
+      - name: Verify artifacts
+        run: |
+          set -euo pipefail
+          for f in dist/*.so; do
+            test -s "$f" || { echo "empty artifact: $f"; exit 1; }
+          done
+          file dist/*.so || true
+
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum *.so > "SHA256SUMS-${{ matrix.goos }}-${{ matrix.goarch }}.txt"
+          cat "SHA256SUMS-${{ matrix.goos }}-${{ matrix.goarch }}.txt"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: workbuddy-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+  # Publish a GitHub Release holding every platform's artifacts, then tell the
+  # server to update itself. main -> rolling pre-release; v* tag -> that tag.
+  publish:
+    name: publish
+    needs: build
+    # No publishing for PR builds.
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Collect artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: workbuddy-*
+          merge-multiple: true
+
+      - name: Merge checksums and stage files
+        id: stage
+        run: |
+          set -euo pipefail
+          cd dist
+          cat SHA256SUMS-*.txt > SHA256SUMS.txt
+          rm -f SHA256SUMS-linux-*.txt
+          ls -l
+          echo "tag=${{ github.ref == 'refs/heads/main' && 'rolling' || github.ref_name }}" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.stage.outputs.tag }}
+          name: ${{ steps.stage.outputs.tag }}
+          body: |
+            Commit: ${{ github.sha }}
+            Tag: ${{ steps.stage.outputs.tag }}
+
+            Artifacts: workbuddy{,-global}-<goos>-<goarch>.so
+
+            The deploy webhook installs workbuddy-linux-amd64.so and
+            workbuddy-global-linux-amd64.so as plugins/workbuddy.so and
+            plugins/workbuddy-global.so.
+          prerelease: ${{ github.ref == 'refs/heads/main' }}
+          files: |
+            dist/*.so
+            dist/SHA256SUMS.txt
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Push a signed notification to the server instead of relying on GitHub's
+      # release event: editing an existing release (every main push re-uploads
+      # to `rolling`) fires `edited`, not `published`, so event-driven delivery
+      # would silently stop after the first deploy.
+      - name: Notify deploy webhook
+        env:
+          WEBHOOK_URL: ${{ secrets.DEPLOY_WEBHOOK_URL }}
+          WEBHOOK_SECRET: ${{ secrets.DEPLOY_WEBHOOK_SECRET }}
+          TAG: ${{ steps.stage.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -z "${WEBHOOK_URL}" ] || [ -z "${WEBHOOK_SECRET}" ]; then
+            echo "DEPLOY_WEBHOOK_URL/SECRET not configured; skipping notify."
+            exit 0
+          fi
+          base="https://github.com/${{ github.repository }}/releases/download/${TAG}"
+          # Built with printf on one line: the HMAC covers these exact bytes, so
+          # the payload must not pick up a heredoc's indentation.
+          payload=$(printf '{"tag":"%s","sha":"%s","assets":[{"name":"workbuddy-linux-amd64.so","url":"%s/workbuddy-linux-amd64.so"},{"name":"workbuddy-global-linux-amd64.so","url":"%s/workbuddy-global-linux-amd64.so"}]}' \
+            "${TAG}" "${{ github.sha }}" "${base}" "${base}")
+          sig=$(printf '%s' "$payload" \
+            | openssl dgst -sha256 -hmac "${WEBHOOK_SECRET}" -hex \
+            | sed 's/^.* //')
+          echo "posting to webhook for tag ${TAG}"
+          echo "payload: ${payload}"
+          curl -fsS --max-time 60 \
+            -X POST "${WEBHOOK_URL}" \
+            -H 'Content-Type: application/json' \
+            -H 'X-GitHub-Event: deploy' \
+            -H "X-Hub-Signature-256: sha256=${sig}" \
+            --data-binary "$payload"

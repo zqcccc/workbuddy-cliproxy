@@ -420,6 +420,69 @@ plugins:
 
 重启 CPA,日志出现 `plugin loaded ... plugin_id=workbuddy` 即成功,`GET /v1/models` 也能看到上面的模型。然后到 CPA 面板添加 workbuddy 凭据,扫码登录 CodeBuddy。
 
+### 直接用预编译产物(不用本地编译)
+
+GitHub Actions 会为每次构建产出各平台的 `.so`,发布在两个 tag 上:
+
+| tag | 时机 | 内容 |
+| --- | --- | --- |
+| `rolling` | 每次 push `main` | 全平台,预发布 |
+| `v*` | 打了 `v` 开头的 tag | 全平台,正式发布 |
+
+命名规则 `workbuddy-<goos>-<goarch>.so` / `workbuddy-global-<goos>-<goarch>.so`,
+例如 Linux x86_64 取 `workbuddy-linux-amd64.so`。装到 CPA 的 `plugins/` 时**要改回**
+`workbuddy.so` / `workbuddy-global.so` —— 宿主是按文件名认 plugin id 的。
+
+```bash
+# 例:Linux x86_64,取 rolling 最新构建
+base=https://github.com/zqcccc/workbuddy-cliproxy/releases/download/rolling
+curl -fL -o plugins/workbuddy.so        $base/workbuddy-linux-amd64.so
+curl -fL -o plugins/workbuddy-global.so $base/workbuddy-global-linux-amd64.so
+docker restart cli-proxy-api-plus   # 插件是启动时加载的,必须重启
+```
+
+## 自动部署(CI → 服务器)
+
+`deploy/` 下是一个 webhook 接收端:CI 构建完直接把它签过名的产物清单 POST 到服务器,
+服务器校验签名 → 下载本平台的 `.so` → 备份旧文件 → 覆盖 → 重启 CPA 容器。
+
+```
+push main / tag
+      ↓
+GitHub Actions: 各平台 build, 产物上传到 Release
+      ↓
+CI 用 HMAC-SHA256 签名 POST 到 https://<你的域名>/hooks/plugin-deploy
+      ↓
+服务器: 校验 X-Hub-Signature-256 → 挑 linux-amd64 的 .so → 备份 → 覆盖 → docker restart
+```
+
+CI 直接推而不用 GitHub 的 `release` 事件,是因为每次 push `main` 都是**更新**同一个
+`rolling` release,GitHub 只会发 `edited` 而不会发 `published`,靠事件就只生效一次。
+
+**一次性配置**:
+
+1. 在 GitHub 仓库 Settings → Secrets 加两个变量(我没有写 secrets 的权限,这一步要手动):
+   - `DEPLOY_WEBHOOK_URL` = `https://<你的域名>/hooks/plugin-deploy`
+   - `DEPLOY_WEBHOOK_SECRET` = 服务器上生成的那个 secret
+2. 服务器上跑安装脚本(会生成 secret、装 systemd 单元):
+
+```bash
+ssh cn2 'bash -s' < deploy/setup-cn2.sh
+```
+
+3. 把脚本打印的 Caddy 片段加进 `/etc/caddy/Caddyfile`,然后 `systemctl reload caddy`。
+
+**日常运维**:
+
+```bash
+ssh cn2 journalctl -u plugin-deploy-webhook -f   # 看部署日志
+ssh cn2 python3 /opt/plugin-deploy/deploy-webhook.py status
+ssh cn2 python3 /opt/plugin-deploy/deploy-webhook.py rollback   # 列出可回滚的备份
+```
+
+配置文件 `/opt/plugin-deploy/plugin-deploy.env`(`chmod 600`,里面有共享密钥)。
+改 `DRY_RUN=1` 可以只看会发生什么、不动线上文件。
+
 ## 使用
 
 CPA 默认端口 `8317`,API key 见 `config.yaml` 的 `api-keys`。
