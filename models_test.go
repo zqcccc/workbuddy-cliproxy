@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/json"
+	"reflect"
+	"sort"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
@@ -585,5 +587,84 @@ func TestLiveCatalogBeatsMeasuredTable(t *testing.T) {
 	if got.ContextLength != 500000 || got.MaxCompletionTokens != 32000 {
 		t.Errorf("got ctx=%d out=%d, want the live 500000/32000 to override the measured table",
 			got.ContextLength, got.MaxCompletionTokens)
+	}
+}
+
+// configEnvelope builds the plugin.register payload the host sends with a
+// config block attached.
+func configEnvelope(t *testing.T, cfgYAML string) []byte {
+	t.Helper()
+	raw, err := json.Marshal(map[string]any{"config_yaml": []byte(cfgYAML)})
+	if err != nil {
+		t.Fatalf("marshal envelope: %v", err)
+	}
+	return raw
+}
+
+// withPluginConfig installs a config block for one test and restores the
+// previous one afterwards, so a mode set here cannot leak into another test.
+func withPluginConfig(t *testing.T, cfgYAML string) {
+	t.Helper()
+	applyConfigYAML(configEnvelope(t, cfgYAML))
+	t.Cleanup(func() {
+		applyConfigYAML(configEnvelope(t, "publish_mode: \"\"\npublish_allow: []\nextra_models: []\nmodel_prefix: \"\"\n"))
+	})
+}
+
+func publishIDs(models []upstreamModel) []string {
+	out := make([]string, 0, len(models))
+	for _, m := range models {
+		out = append(out, m.ID)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// TestApplyPublishPolicyAllowLeavesOtherProvidersAlone pins the guard against
+// the failure this mode exists for: with force-model-prefix unset the host
+// matches a bare id against "<prefix>/<id>" too, so a plugin publishing
+// global/gpt-5.6-luna also captures plain gpt-5.6-luna — traffic that belongs
+// to the codex/openai provider and that this account cannot serve.
+func TestApplyPublishPolicyAllowLeavesOtherProvidersAlone(t *testing.T) {
+	withPluginConfig(t, `
+publish_mode: allow
+publish_allow:
+  - hy3
+extra_models:
+  - hy4-preview-f
+`)
+	remote := []upstreamModel{
+		{ID: "hy3"},
+		{ID: "hy4-preview-f"},
+		{ID: "gpt-5.6-luna"},
+		{ID: "kimi-k3-1"},
+	}
+	got := publishIDs(applyPublishPolicy(remote, &storedAuth{}))
+	want := []string{"hy3", "hy4-preview-f"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("published %v, want %v", got, want)
+	}
+}
+
+// TestApplyPublishPolicyDefaultsToWholeCatalog keeps the historical behaviour:
+// without publish_mode the plugin advertises everything upstream serves.
+func TestApplyPublishPolicyDefaultsToWholeCatalog(t *testing.T) {
+	withPluginConfig(t, "extra_models:\n  - hy4-preview-f\n")
+	remote := []upstreamModel{{ID: "hy3"}, {ID: "gpt-5.6-luna"}}
+	got := publishIDs(applyPublishPolicy(remote, &storedAuth{}))
+	want := []string{"gpt-5.6-luna", "hy3"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("published %v, want %v", got, want)
+	}
+}
+
+// TestApplyPublishPolicyAllowOnlyFiltersNeverAdds makes sure publish_allow
+// cannot invent an id the catalog does not serve.
+func TestApplyPublishPolicyAllowOnlyFiltersNeverAdds(t *testing.T) {
+	withPluginConfig(t, "publish_mode: allow\npublish_allow:\n  - not-in-catalog\n")
+	remote := []upstreamModel{{ID: "hy3"}}
+	got := publishIDs(applyPublishPolicy(remote, &storedAuth{}))
+	if len(got) != 0 {
+		t.Fatalf("published %v, want nothing", got)
 	}
 }
