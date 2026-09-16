@@ -163,13 +163,28 @@ type pluginConfig struct {
 	// a Global credential even when CN offers the same id. The bare id stays
 	// available unless force-model-prefix is set globally.
 	ModelPrefix string `yaml:"model_prefix"`
+	// PublishMode decides how much of the discovered catalog this instance
+	// advertises. The default ("catalog") publishes everything upstream lists.
+	// "allow" publishes only extra_models plus the ids listed in publish_allow.
+	//
+	// It exists because a published id is a claim: with force-model-prefix
+	// unset, the host also matches a bare id against "<prefix>/<id>", so a
+	// plugin that publishes another provider's model (say gpt-5.6-luna, which
+	// codex also serves) silently steals that traffic and bills it to this
+	// account. Restricting the list to models only this realm can serve is
+	// the only way to opt out without touching the other provider.
+	PublishMode string `yaml:"publish_mode"`
+	// PublishAllow adds catalog ids to keep when publish_mode is "allow".
+	PublishAllow []string `yaml:"publish_allow"`
 }
 
 var (
-	cfgMu          sync.Mutex
-	cfgRegion      = buildRegion
-	cfgExtraModels []extraModelSpec
-	cfgModelPrefix string
+	cfgMu           sync.Mutex
+	cfgRegion       = buildRegion
+	cfgExtraModels  []extraModelSpec
+	cfgModelPrefix  string
+	cfgPublishMode  string
+	cfgPublishAllow []string
 )
 
 // applyConfigYAML reads the host-supplied config block from a plugin.register /
@@ -196,6 +211,16 @@ func applyConfigYAML(raw []byte) {
 	}
 	cfgExtraModels = cfg.ExtraModels
 	cfgModelPrefix = strings.TrimSpace(cfg.ModelPrefix)
+	cfgPublishMode = strings.ToLower(strings.TrimSpace(cfg.PublishMode))
+	cfgPublishAllow = cfg.PublishAllow
+}
+
+// configuredPublish returns the publish mode and the extra ids to keep when
+// the mode is "allow".
+func configuredPublish() (mode string, allow []string) {
+	cfgMu.Lock()
+	defer cfgMu.Unlock()
+	return cfgPublishMode, cfgPublishAllow
 }
 
 func configuredRegion() string {
@@ -1076,6 +1101,59 @@ func handleRefreshAuth(raw []byte) ([]byte, error) {
 // Executor handlers
 // -----------------------------------------------------------------------------
 
+// warnIfUncataloguedModel logs once per account and model when the requested
+// id is one upstream does not list. Upstream answers such ids with a silent
+// fallback to its default backend rather than an error, so a model that looks
+// fine to the client can be served by something else entirely: the Global realm
+// has no hy4 family in /v3/config, and hy4-preview there is answered by
+// minimax-m3, which cannot read images. Without this line the only symptom is
+// an inexplicably dumb model.
+func warnIfUncataloguedModel(sa *storedAuth, model string) {
+	id := strings.TrimSpace(stripModelPrefix(model))
+	if id == "" {
+		return
+	}
+	known, cached := catalogKnowsModel(sa, id)
+	if !cached || known {
+		// Cold cache: the catalog has not been fetched for this account yet,
+		// so silence is better than a warning on every start.
+		return
+	}
+	key := normalizeRegion(sa.Region) + ":" + accountIdentity(sa) + ":" + id
+	now := time.Now()
+	uncataloguedWarns.mu.Lock()
+	defer uncataloguedWarns.mu.Unlock()
+	if last, ok := uncataloguedWarns.at[key]; ok && now.Sub(last) < uncataloguedWarnInterval {
+		return
+	}
+	uncataloguedWarns.at[key] = now
+	hostLog("warn", "workbuddy: requested model is not in the upstream catalog, upstream will fall back to its default backend", map[string]any{
+		"uid":    sa.Account.UID,
+		"region": normalizeRegion(sa.Region),
+		"model":  id,
+	})
+}
+
+// uncataloguedWarnInterval throttles the warning so a hot chat loop with an
+// unknown model produces one line per window instead of one per request.
+const uncataloguedWarnInterval = 10 * time.Minute
+
+var uncataloguedWarns = struct {
+	mu sync.Mutex
+	at map[string]time.Time
+}{at: map[string]time.Time{}}
+
+// stripModelPrefix removes this plugin's routing prefix from a model id the
+// client sent. The host uses the prefix to pick a credential and forwards the
+// name unchanged, but upstream only knows the bare id.
+func stripModelPrefix(id string) string {
+	prefix := configuredModelPrefix()
+	if prefix == "" {
+		return id
+	}
+	return strings.TrimPrefix(id, prefix+"/")
+}
+
 func handleExecExecute(raw []byte) ([]byte, error) {
 	var req pluginapi.ExecutorRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
@@ -1085,6 +1163,7 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	warnIfUncataloguedModel(sa, req.Model)
 	// CodeBuddy rejects non-stream requests (code 11101), so always stream
 	// upstream and fold the chunks into a single chat.completion object.
 	body := stripModelPrefixInBody(ensureSystemFirst(rewriteSystemForUpstream(forceStreamBody(req.Payload, req.OriginalRequest)), sa.Region))
@@ -1130,6 +1209,7 @@ func handleExecStream(raw []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	warnIfUncataloguedModel(sa, req.Model)
 	body := req.Payload
 	if len(body) == 0 {
 		body = req.OriginalRequest

@@ -181,6 +181,23 @@ suggestion、提示词增强,不能走 chat completions)。
         - hy4-preview-x
 ```
 
+国际版目录同样会漏掉 deepseek 系列(`deepseek-v4.1-flash` 能调通但不在 `/v3/config` 里)。
+这类"目录里查不到"的 id 建议用对象写法把上限写死,否则会落到 200000/8192 的兜底值
+(见下节),cn2 上就是这么配的:
+
+```yaml
+      extra_models:
+        - id: deepseek-v4.1-flash     # 上限取自国内版目录,国际版无接口可证
+          name: Deepseek-V4.1-Flash
+          maxInputTokens: 1000000
+          maxOutputTokens: 128000
+          maxAllowedSize: 1000000
+          supportsImages: true
+          supportsToolCall: true
+          supportsReasoning: true
+          onlyReasoning: true
+```
+
 规则:已在上游目录里的 id 不会重复添加(保留上游的真实元数据);`completion-` / `nes-` /
 `enhance-` 这些内部模型配了也会被忽略。
 
@@ -261,8 +278,48 @@ hy3           in=192000   out=64000
 `global/kimi-k2.5`。所以插件自己要在发出去之前剥掉(`stripModelPrefixInBody`),否则上游
 报 `11102 service info not found`。这一点是实测踩出来的。
 
-加了前缀后还会顺带解放一些被别的 provider 抢注的 id:`gpt-5.6-luna` / `gpt-5.6-terra`
+加了前缀后还会顺带解放一些被别的 provider 占着的 id:`gpt-5.6-luna` / `gpt-5.6-terra`
 原本归 openai provider,现在能以 `global/gpt-5.6-luna` 走国际版。
+
+> ⚠️ **前缀是"加一份",不是"改名字"**,裸 id 依然会注册。而且
+> `force-model-prefix: false`(默认)时宿主**会把裸 id 也匹配到 `<prefix>/<id>` 上**,
+> 于是插件一旦发布 `global/gpt-5.6-luna`,裸 `gpt-5.6-luna` 的流量也会落到本插件 ——
+> 再叠加插件 priority(100/200)高于内置 provider(默认 0),本插件反而排到 openai **前面**。
+> 若国际版账号对该 id 没有权限,上游会挂起几十秒后返回空流,请求照发照计费。
+> 要避免这种"抢注",见下一节。
+
+### 只发布指定的模型:`publish_mode` / `publish_allow`
+
+默认插件把上游目录整个发布出去。当目录里的 id **别的 provider 也在提供**时(典型:
+`gpt-5.6-*` 归 openai、`claude-*` / `gemini-*` 归 antigravity),发布它就是把别人的流量
+揽到自己账上。`publish_mode: allow` 让插件只发布白名单:
+
+```yaml
+    workbuddy-global:
+      region: global
+      model_prefix: global
+      publish_mode: allow      # 只发 extra_models + publish_allow
+      publish_allow:
+        - hy3                  # 目录里确实属于本区、且账号能用的 id
+      extra_models:
+        - hy4-preview-f
+        - id: deepseek-v4.1-flash
+          maxInputTokens: 1000000
+          maxOutputTokens: 128000
+```
+
+- `publish_mode: catalog`(默认)发全目录;`allow` 只发 `extra_models` + `publish_allow`。
+- `publish_allow` 只是"从目录里挑",不会凭空造 id;目录里没有的写了也不出现。
+- `allow` 模式下目录拉取失败时**不再回落内置兜底列表**(兜底那几个 id 全是共享 id,
+  盲发等于抢注),此时插件暂时不报任何模型,等目录恢复。
+
+验证方式(改完看有没有让出 id):
+
+```bash
+curl -s http://<cpa>/v1/models -H "Authorization: Bearer <key>" \
+  | python3 -c "import sys,json,collections;d=json.load(sys.stdin)['data'];\
+b=collections.defaultdict(list);[b[m['owned_by']].append(m['id']) for m in d];print(dict(b))"
+```
 
 ### 上游 429 时冷却该凭证
 

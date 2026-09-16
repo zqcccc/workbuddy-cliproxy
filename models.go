@@ -476,6 +476,11 @@ func toModelInfos(models []upstreamModel) []pluginapi.ModelInfo {
 type modelCacheEntry struct {
 	models  []pluginapi.ModelInfo
 	expires time.Time
+	// remoteIDs is the id set of the catalog upstream actually served, before
+	// extra_models added anything. It is what tells a real model apart from an
+	// id we publish on our own: upstream answers unknown ids with a silent
+	// fallback to its default backend instead of an error.
+	remoteIDs map[string]struct{}
 }
 
 var modelCache = struct {
@@ -504,6 +509,43 @@ func modelCacheStore(key string, models []pluginapi.ModelInfo) {
 	modelCache.mu.Lock()
 	defer modelCache.mu.Unlock()
 	modelCache.entries[key] = &modelCacheEntry{models: models, expires: time.Now().Add(modelCacheTTL)}
+}
+
+// modelCacheRememberRemote attaches the raw catalog ids to the cached entry so
+// a request can later be checked against what upstream really serves. It is a
+// separate call from modelCacheStore to keep that signature untouched; the ids
+// live as long as the models they came from.
+func modelCacheRememberRemote(key string, remote []upstreamModel) {
+	ids := make(map[string]struct{}, len(remote))
+	for _, m := range remote {
+		if id := strings.TrimSpace(m.ID); id != "" {
+			ids[id] = struct{}{}
+		}
+	}
+	modelCache.mu.Lock()
+	defer modelCache.mu.Unlock()
+	entry, ok := modelCache.entries[key]
+	if !ok || time.Now().After(entry.expires) {
+		entry = &modelCacheEntry{expires: time.Now().Add(modelCacheTTL)}
+		modelCache.entries[key] = entry
+	}
+	entry.remoteIDs = ids
+}
+
+// catalogKnowsModel reports whether id is in the account's upstream catalog.
+// The second result is false when nothing usable is cached yet, so callers can
+// tell "not cached" apart from "not a real model" and stay silent in the first
+// case instead of warning on every cold start.
+func catalogKnowsModel(sa *storedAuth, id string) (known, cached bool) {
+	key := modelCacheKey(pluginapi.AuthModelRequest{}, sa)
+	modelCache.mu.Lock()
+	entry := modelCache.entries[key]
+	modelCache.mu.Unlock()
+	if entry == nil || entry.remoteIDs == nil || time.Now().After(entry.expires) {
+		return false, false
+	}
+	_, ok := entry.remoteIDs[id]
+	return ok, true
 }
 
 // -----------------------------------------------------------------------------
@@ -540,16 +582,73 @@ func modelsForAuth(req pluginapi.AuthModelRequest, sa *storedAuth) []pluginapi.M
 			"uid":   sa.Account.UID,
 			"error": reason,
 		})
+		// The fallback list is shared ids (gpt-5.5, gemini-3.5-flash, ...),
+		// exactly the ones publish_mode=allow exists to give up. Advertising
+		// them blind would claim traffic that belongs to another provider, so
+		// an allow-list instance stays silent until discovery recovers.
+		if mode, _ := configuredPublish(); mode == "allow" {
+			return nil
+		}
 		return fallbackModels()
 	}
+	remote = applyPublishPolicy(remote, sa)
 	models := appendExtraModels(toModelInfos(remote), remote)
 	modelCacheStore(key, models)
+	modelCacheRememberRemote(key, remote)
 	hostLog("info", "workbuddy: model discovery succeeded", map[string]any{
 		"uid":   sa.Account.UID,
 		"count": len(models),
 	})
 	return models
 }
+
+// applyPublishPolicy drops catalog ids this instance must not claim.
+//
+// The default mode publishes the whole catalog, which is right when this
+// realm is the only source for those ids. It is wrong the moment another
+// provider serves the same id: with force-model-prefix unset the host matches
+// a bare request id against "<prefix>/<id>" as well, so publishing
+// "global/gpt-5.6-luna" also captures plain "gpt-5.6-luna" and sends that
+// traffic to CodeBuddy, where the account cannot serve it and the upstream
+// answers with an empty stream after billing the request.
+//
+// "allow" keeps only extra_models plus publish_allow, so an operator can list
+// exactly the models only this realm provides (hy4-preview-f, hy3, ...) and
+// leave every shared id to its real provider.
+func applyPublishPolicy(remote []upstreamModel, sa *storedAuth) []upstreamModel {
+	mode, allow := configuredPublish()
+	if mode != "allow" {
+		return remote
+	}
+	keep := make(map[string]struct{}, len(allow)+8)
+	for _, spec := range configuredExtraModels() {
+		if id := strings.TrimSpace(spec.upstreamModel.ID); id != "" {
+			keep[id] = struct{}{}
+		}
+	}
+	for _, id := range allow {
+		if id = strings.TrimSpace(id); id != "" {
+			keep[id] = struct{}{}
+		}
+	}
+	out := make([]upstreamModel, 0, len(keep))
+	for _, m := range remote {
+		if _, ok := keep[strings.TrimSpace(m.ID)]; ok {
+			out = append(out, m)
+		}
+	}
+	publishLogOnce.Do(func() {
+		hostLog("info", "workbuddy: publish_mode=allow, restricting advertised models", map[string]any{
+			"uid":      sa.Account.UID,
+			"region":   normalizeRegion(sa.Region),
+			"kept":     len(out),
+			"filtered": len(remote) - len(out),
+		})
+	})
+	return out
+}
+
+var publishLogOnce sync.Once
 
 // appendExtraModels adds the entries configured under plugins.configs.<id>.
 // extra_models. Upstream catalogs are not always complete: the Global realm
