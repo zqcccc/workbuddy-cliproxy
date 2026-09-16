@@ -272,7 +272,25 @@ hy3           in=192000   out=64000
 宿主会把它展开成 `<prefix>/<model>`(`sdk/cliproxy/service_models.go` `applyModelPrefixes`,
 格式固定是 `前缀 + "/" + id`),选路时用 `rewriteModelForAuth` 把前缀剥掉再匹配 ——
 所以 `global/kimi-k2.5` 一定落在国际版凭据上,而裸 `kimi-k2.5` 仍然按 priority 走国内。
-两种名字会同时存在(除非在 CPA 全局开 `force-model-prefix`,那会影响所有 provider,不建议)。
+
+**默认两种名字会同时存在**,即裸 id 也会注册到本插件名下(见下节为什么要避免)。
+想让**只有** `<prefix>/<model>` 命中本插件,在 CPA 全局开:
+
+```yaml
+force-model-prefix: true
+```
+
+看起来是"全局"开关,其实**只对配了 `model_prefix` 的 provider 生效**,可以放心开:
+`applyModelPrefixes` 第一行就是 `if trimmedPrefix == "" { return models }`,内置 provider
+(codex / antigravity / gemini…)和没配前缀的插件根本没有 prefix,直接原样返回,不受影响。
+(早期 README 说"会影响所有 provider"是错的,已订正。)
+
+开启后实测:
+
+| 请求 | 归属 |
+|---|---|
+| `global/hy4-preview-f` | workbuddy-global(国际版) |
+| 裸 `hy4-preview-f` | 让给别的 provider(本例落到国内的 workbuddy) |
 
 **注意宿主只剥前缀做"选路",不会改写转发给插件的请求体** —— 插件拿到的 `model` 还是
 `global/kimi-k2.5`。所以插件自己要在发出去之前剥掉(`stripModelPrefixInBody`),否则上游

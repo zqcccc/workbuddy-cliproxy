@@ -237,6 +237,17 @@ func configuredExtraModels() []extraModelSpec {
 	return cfgExtraModels
 }
 
+// isConfiguredExtraModel reports whether the operator listed this id under
+// extra_models, i.e. published it on purpose despite the catalog omitting it.
+func isConfiguredExtraModel(id string) bool {
+	for _, spec := range configuredExtraModels() {
+		if strings.TrimSpace(spec.upstreamModel.ID) == id {
+			return true
+		}
+	}
+	return false
+}
+
 // configuredModelPrefix returns the namespace prepended to this instance's
 // model ids, or "" when the operator left it unset.
 func configuredModelPrefix() string {
@@ -1111,6 +1122,13 @@ func handleRefreshAuth(raw []byte) ([]byte, error) {
 func warnIfUncataloguedModel(sa *storedAuth, model string) {
 	id := strings.TrimSpace(stripModelPrefix(model))
 	if id == "" {
+		return
+	}
+	// An id the operator listed in extra_models is deliberately outside the
+	// catalog — that is the whole point of the setting — and it is known to be
+	// served for real (hy4-preview-f answers with its own reasoning trace and
+	// bills zero credits). Warning about it here would only cry wolf.
+	if isConfiguredExtraModel(id) {
 		return
 	}
 	known, cached := catalogKnowsModel(sa, id)
