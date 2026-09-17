@@ -1289,6 +1289,8 @@ func pumpUpstreamStream(httpReq *http.Request, streamID string, sseFramed bool, 
 		return
 	}
 	clearCooldown(sa)
+	var st upstreamStreamState
+	aborted := false
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 	for scanner.Scan() {
@@ -1300,11 +1302,18 @@ func pumpUpstreamStream(httpReq *http.Request, streamID string, sseFramed bool, 
 		if cleaned == "" {
 			continue
 		}
+		st.observe(cleaned)
 		if sseFramed {
 			cleaned = "data: " + cleaned
 		}
 		if err := streamEmit(streamID, []byte(cleaned)); err != nil {
+			aborted = true
 			break
+		}
+	}
+	if !aborted && scanner.Err() == nil && sseFramed {
+		if payload := st.trailingChunk(); payload != "" {
+			_ = streamEmit(streamID, []byte("data: "+payload))
 		}
 	}
 	streamClose(streamID)
@@ -1357,6 +1366,7 @@ func clientNeedsSSEFrame(metadata map[string]any) bool {
 // the payload is the raw JSON object and the host chat-completions writer adds
 // the framing itself.
 func aggregateSSE(r io.Reader, sseFramed bool) []pluginapi.ExecutorStreamChunk {
+	var st upstreamStreamState
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 	var chunks []pluginapi.ExecutorStreamChunk
@@ -1369,12 +1379,116 @@ func aggregateSSE(r io.Reader, sseFramed bool) []pluginapi.ExecutorStreamChunk {
 		if cleaned == "" {
 			continue
 		}
+		st.observe(cleaned)
 		if sseFramed {
 			cleaned = "data: " + cleaned
 		}
 		chunks = append(chunks, pluginapi.ExecutorStreamChunk{Payload: []byte(cleaned)})
 	}
+	if scanner.Err() == nil && sseFramed {
+		if payload := st.trailingChunk(); payload != "" {
+			chunks = append(chunks, pluginapi.ExecutorStreamChunk{Payload: []byte("data: " + payload)})
+		}
+	}
 	return chunks
+}
+
+// upstreamStreamState records what an upstream stream actually produced. It
+// exists to close one host-side gap: CPA v7.2.157's chat-completions → responses
+// translator never emits response.completed when a response has no message item
+// and no tool-call item (openai_openai-responses_response.go:641), so a
+// reasoning-only turn ends the SSE stream without a terminal event and codex
+// clients fail with "upstream stream closed before a terminal event (last event:
+// response.output_item.done)".
+type upstreamStreamState struct {
+	sawReasoning bool
+	sawContent   bool
+	sawToolCalls bool
+	finishReason string
+	id           string
+	model        string
+	created      int64
+}
+
+// observe records one cleaned upstream chunk payload (raw JSON, no SSE framing).
+func (s *upstreamStreamState) observe(payload string) {
+	var obj map[string]any
+	if json.Unmarshal([]byte(payload), &obj) != nil {
+		return
+	}
+	if v, _ := obj["id"].(string); v != "" {
+		s.id = v
+	}
+	if v, _ := obj["model"].(string); v != "" {
+		s.model = v
+	}
+	if v, _ := obj["created"].(float64); v > 0 {
+		s.created = int64(v)
+	}
+	choices, _ := obj["choices"].([]any)
+	for _, c := range choices {
+		choice, _ := c.(map[string]any)
+		if choice == nil {
+			continue
+		}
+		if v, _ := choice["finish_reason"].(string); v != "" {
+			s.finishReason = v
+		}
+		delta, _ := choice["delta"].(map[string]any)
+		if delta == nil {
+			continue
+		}
+		if reasoningDelta(delta) != "" {
+			s.sawReasoning = true
+		}
+		if v, _ := delta["content"].(string); v != "" {
+			s.sawContent = true
+		}
+		if tcs, ok := delta["tool_calls"].([]any); ok && len(tcs) > 0 {
+			s.sawToolCalls = true
+		}
+	}
+}
+
+// reasoningDelta pulls the incremental reasoning text out of a delta, whatever
+// field name the upstream chose.
+func reasoningDelta(delta map[string]any) string {
+	for _, key := range []string{"reasoning_content", "reasoning", "thinking", "thinking_content"} {
+		if v, _ := delta[key].(string); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// trailingChunk synthesises the minimal final chunk that turns a reasoning-only
+// response into a well-formed one: one content delta plus a finish reason. The
+// delta is a single space on purpose — an empty delta is dropped by both this
+// plugin (cleanChunkJSON) and the host, and with no non-empty delta the host
+// still withholds response.completed. Returns "" when nothing should be added.
+func (s *upstreamStreamState) trailingChunk() string {
+	if !s.sawReasoning || s.sawContent || s.sawToolCalls {
+		return ""
+	}
+	finish := s.finishReason
+	if finish == "" {
+		finish = "stop"
+	}
+	out, err := json.Marshal(map[string]any{
+		"id":      s.id,
+		"object":  "chat.completion.chunk",
+		"created": s.created,
+		"model":   s.model,
+		"choices": []any{map[string]any{
+			"index":         0,
+			"delta":         map[string]any{"content": " "},
+			"finish_reason": finish,
+		}},
+	})
+	if err != nil {
+		return ""
+	}
+	return string(out)
 }
 
 // cleanChunkJSON strips empty-valued fields (null/""/[]/{}) from choice deltas
