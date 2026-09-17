@@ -67,8 +67,8 @@ func TestAggregateSSEAppendsTrailingChunkOnce(t *testing.T) {
 	if !strings.HasPrefix(last, "data: ") {
 		t.Fatalf("synthetic chunk must be SSE framed, got %q", last)
 	}
-	if !strings.Contains(last, `"finish_reason":"stop"`) {
-		t.Fatalf("synthetic chunk missing stop finish reason: %s", last)
+	if !strings.Contains(last, `"finish_reason":"length"`) {
+		t.Fatalf("synthetic chunk should report the truncated turn as length: %s", last)
 	}
 }
 

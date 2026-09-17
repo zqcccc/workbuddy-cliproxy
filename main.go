@@ -1311,8 +1311,22 @@ func pumpUpstreamStream(httpReq *http.Request, streamID string, sseFramed bool, 
 			break
 		}
 	}
-	if !aborted && scanner.Err() == nil && sseFramed {
+	// The trailing delta is emitted even when the upstream connection died
+	// mid-stream: the client is about to fail with "upstream stream closed
+	// before a terminal event" either way, and it has already streamed the
+	// reasoning text, so finishing the response is strictly better than
+	// dropping the whole turn. Only a client that hung up (aborted) is skipped.
+	if !aborted && sseFramed {
 		if payload := st.trailingChunk(); payload != "" {
+			errText := ""
+			if err := scanner.Err(); err != nil {
+				errText = err.Error()
+			}
+			hostLog("warn", "workbuddy: reasoning-only stream, synthesising trailing content delta", map[string]any{
+				"stream_id":   streamID,
+				"scanner_err": errText,
+				"finish":      st.finishReason,
+			})
 			_ = streamEmit(streamID, []byte("data: "+payload))
 		}
 	}
@@ -1385,7 +1399,7 @@ func aggregateSSE(r io.Reader, sseFramed bool) []pluginapi.ExecutorStreamChunk {
 		}
 		chunks = append(chunks, pluginapi.ExecutorStreamChunk{Payload: []byte(cleaned)})
 	}
-	if scanner.Err() == nil && sseFramed {
+	if sseFramed {
 		if payload := st.trailingChunk(); payload != "" {
 			chunks = append(chunks, pluginapi.ExecutorStreamChunk{Payload: []byte("data: " + payload)})
 		}
@@ -1472,7 +1486,11 @@ func (s *upstreamStreamState) trailingChunk() string {
 	}
 	finish := s.finishReason
 	if finish == "" {
-		finish = "stop"
+		// No finish reason means the model never produced an answer: the
+		// reasoning ate the output budget or the stream was cut. Say so,
+		// which surfaces as response.incomplete (also a terminal event),
+		// rather than claiming a clean stop.
+		finish = "length"
 	}
 	out, err := json.Marshal(map[string]any{
 		"id":      s.id,
