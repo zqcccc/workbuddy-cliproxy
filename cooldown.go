@@ -41,6 +41,15 @@ type cooldownState struct {
 	until    time.Time
 	failures int
 	model    string
+	// exhausted marks a 14018 refusal: this credential's copy of the model has
+	// spent its credits. Upstream does not lift that on a timer the way it
+	// lifts a frequency window, so the model is held out for the longest
+	// window we are willing to keep one hidden, and it is advertised again
+	// only after a success or the hold expiring — never because another
+	// credential can serve it. Other models on the same credential keep their
+	// own state: per-model quotas are independent, and one model running dry
+	// says nothing about the rest.
+	exhausted bool
 	// reason is what upstream said when it refused. Kept so a request that
 	// arrives during the cooldown can be turned down without asking upstream
 	// again — and so the log explains the refusal.
@@ -67,11 +76,36 @@ func cooldownModel(model string) string {
 	return strings.TrimSpace(stripModelPrefix(strings.TrimSpace(model)))
 }
 
+// throttleExhausted reports whether a 429 body is a 14018 credits-exhausted
+// refusal. That is per-model state: each credential's copy of a model spends
+// its own credits, so one model running dry says nothing about the others on
+// the same account. Unlike a frequency window it is not on a timer, so the
+// model is held out for the longest window and advertised again only after a
+// success or the hold expiring.
+func throttleExhausted(body []byte) bool {
+	if len(body) == 0 {
+		return false
+	}
+	var envelope struct {
+		Code int `json:"code"`
+	}
+	if json.Unmarshal(body, &envelope) != nil {
+		return false
+	}
+	return envelope.Code == 14018
+}
+
 // markCooldown backs off one model on one credential.
 //
 // An explicit hint from upstream wins: Retry-After first, then the reset
 // timestamp the 429 body carries, and only then our own exponential guess.
 // Repeated failures grow the guess, never the hint.
+//
+// Quotas are per (credential, model), so a 429 always parks exactly the id
+// upstream refused — never the whole account. A 14018 credits-exhausted
+// refusal additionally marks the model exhausted and holds it out for the
+// longest window: upstream lifts frequency limits on a timer, but spent
+// credits stay spent.
 func markCooldown(sa *storedAuth, resp *http.Response, model string, body []byte) {
 	id := cooldownModel(model)
 	wait := time.Duration(0)
@@ -92,6 +126,7 @@ func markCooldown(sa *storedAuth, resp *http.Response, model string, body []byte
 
 	credential := accountIdentity(sa)
 	key := cooldownKey(credential, id)
+	exhausted := throttleExhausted(body)
 	why := upstreamReason(body)
 
 	cdMu.Lock()
@@ -99,7 +134,12 @@ func markCooldown(sa *storedAuth, resp *http.Response, model string, body []byte
 	st.failures++
 	st.model = id
 	st.reason = why
-	if wait <= 0 {
+	if exhausted {
+		st.exhausted = true
+		// Credits are gone, not on a timer: hold the model out for the
+		// longest window we are willing to keep one hidden.
+		wait = cooldownResetMax
+	} else if wait <= 0 {
 		shift := st.failures - 1
 		if shift > 5 {
 			shift = 5
@@ -124,26 +164,31 @@ func markCooldown(sa *storedAuth, resp *http.Response, model string, body []byte
 		"seconds":  int(wait.Seconds()),
 		"failures": st.failures,
 	}
+	if exhausted {
+		fields["exhausted"] = true
+	}
 	if resp != nil {
 		fields["status"] = resp.StatusCode
 	}
 	if why != "" {
 		fields["reason"] = why
 	}
-	hostLog("warn", "workbuddy: model cooling down after upstream backoff", fields)
+	level := "model"
+	if exhausted {
+		level = "model credits exhausted"
+	}
+	hostLog("warn", "workbuddy: "+level+" cooling down after upstream backoff", fields)
 }
 
 // clearCooldown forgives one model once it has served a request again. Other
 // ids keep whatever backoff they earned: a 429 names one model, not the
-// account.
+// account, and per-model quotas are independent.
 func clearCooldown(sa *storedAuth, model string) {
 	id := cooldownModel(model)
 	key := cooldownKey(accountIdentity(sa), id)
 	cdMu.Lock()
 	if st, ok := cooling[key]; ok && st.failures > 0 {
 		delete(cooling, key)
-		cdMu.Unlock()
-		return
 	}
 	cdMu.Unlock()
 }
@@ -171,14 +216,24 @@ func cooldownReason(credential, model string) string {
 // suppressModel reports whether this credential should stop advertising one
 // model id because upstream throttled it.
 //
-// It only suppresses when some other recently seen credential is not backed
-// off for the same id. If nobody else can serve it, hiding the model would
-// turn a real upstream error into a confusing "unknown model", so in that case
-// we keep advertising and let the error surface.
+// An exhausted model (14018) is hidden unconditionally: its credits are spent,
+// upstream will not lift that because another credential can serve the id, and
+// advertising it just keeps 429s flowing. A frequency backoff only suppresses
+// when some other recently seen credential is not backed off for the same id.
+// If nobody else can serve it, hiding the model would turn a real upstream
+// error into a confusing "unknown model", so in that case we keep advertising
+// and let the error surface.
 func suppressModel(sa *storedAuth, id string) bool {
 	credential := accountIdentity(sa)
 	if cooldownRemaining(credential, id) <= 0 {
 		return false
+	}
+	cdMu.Lock()
+	st, ok := cooling[cooldownKey(credential, id)]
+	exhausted := ok && st.exhausted
+	cdMu.Unlock()
+	if exhausted {
+		return true
 	}
 	cdMu.Lock()
 	defer cdMu.Unlock()

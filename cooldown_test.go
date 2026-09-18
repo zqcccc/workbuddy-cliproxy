@@ -154,3 +154,85 @@ func TestWithoutThrottledModelsKeepsTheRest(t *testing.T) {
 		t.Fatalf("filtering mutated the caller's slice: %d", len(all))
 	}
 }
+
+func TestExhaustedModelParksOnlyThatModel(t *testing.T) {
+	resetCooldowns(t)
+	sa := auth("uid-acc")
+
+	// 14018 credits exhausted is per-model: each credential's copy of a model
+	// spends its own credits, so one model running dry must not bench the
+	// others on the same account.
+	body14018 := []byte(`{"code":14018,"msg":"Credits exhausted, please purchase add-on packs or wait for monthly renewal","requestId":"x"}`)
+	markCooldown(sa, &http.Response{StatusCode: 429, Header: http.Header{}}, "hy4-preview-f", body14018)
+
+	// The refused model is cooling long; the rest of the account is untouched.
+	if rem := cooldownRemaining(accountIdentity(sa), "hy4-preview-f"); rem <= 5*time.Hour {
+		t.Fatalf("exhausted model should be parked for hours, got %v", rem)
+	}
+	if rem := cooldownRemaining(accountIdentity(sa), "deepseek-v4.1-flash"); rem != 0 {
+		t.Fatal("an exhausted model must not cool down other models on the account")
+	}
+	// The exhausted model hides unconditionally — credits are spent, no other
+	// credential can un-spend them — while the others keep advertising.
+	if !suppressModel(sa, "hy4-preview-f") {
+		t.Fatal("an exhausted model must be withheld even without a healthy peer")
+	}
+	if suppressModel(sa, "deepseek-v4.1-flash") {
+		t.Fatal("an unexhausted model must stay advertised")
+	}
+	// The fallback pool still offers the healthy models.
+	id, ok := nextFallbackModel(sa, map[string]struct{}{})
+	if !ok || id == "hy4-preview-f" {
+		t.Fatalf("fallback should skip the exhausted model, got %q", id)
+	}
+	// A success lifts the hold on that model.
+	clearCooldown(sa, "hy4-preview-f")
+	if rem := cooldownRemaining(accountIdentity(sa), "hy4-preview-f"); rem != 0 {
+		t.Fatalf("cooldown survived a success: %v", rem)
+	}
+}
+
+func TestPerModelQuotaStaysModelLevel(t *testing.T) {
+	resetCooldowns(t)
+	sa := auth("uid-quota")
+
+	// 6004 frequency limit and 14003 too many requests are per-model quotas:
+	// upstream names one id and still serves the others, so a single 429 must
+	// not bench the whole account.
+	for _, body := range [][]byte{
+		[]byte(`{"code":6004,"msg":"usage exceeds frequency limit, switch to the other models","requestId":"x"}`),
+		[]byte(`{"code":14003,"msg":"too many requests","requestId":"x"}`),
+	} {
+		resetCooldowns(t)
+		markCooldown(sa, &http.Response{StatusCode: 429, Header: http.Header{}}, "hy4-preview-f", body)
+		if rem := cooldownRemaining(accountIdentity(sa), "hy4-preview-f"); rem <= 0 {
+			t.Fatal("the refused model should be cooling")
+		}
+		if rem := cooldownRemaining(accountIdentity(sa), "deepseek-v4.1-flash"); rem != 0 {
+			t.Fatal("a per-model 429 must not cool down other models")
+		}
+		// A lone credential keeps its models even when one is throttled:
+		// hiding them would turn a real upstream error into "unknown model".
+		if suppressModel(sa, "hy4-preview-f") {
+			t.Fatal("a lone credential must not hide its throttled model")
+		}
+		if suppressModel(sa, "deepseek-v4.1-flash") {
+			t.Fatal("an unthrottled model must stay advertised")
+		}
+	}
+}
+
+func TestModelLevelThrottleKeepsAccountAdvertised(t *testing.T) {
+	resetCooldowns(t)
+	sa := auth("uid-model")
+	// 6004 names one model; the account itself stays in rotation.
+	markCooldown(sa, &http.Response{StatusCode: 429, Header: http.Header{}}, "deepseek-v4.1-flash", throttled)
+	if rem := cooldownRemaining(accountIdentity(sa), "hy3"); rem != 0 {
+		t.Fatal("6004 must not cool down other models")
+	}
+	// A lone credential keeps its other models (existing behaviour): hiding
+	// them would turn a real upstream error into "unknown model".
+	if suppressModel(sa, "hy3") {
+		t.Fatal("a model-level 429 must not suppress the rest of a lone account")
+	}
+}
