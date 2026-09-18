@@ -121,11 +121,13 @@ func sendWithFallback(sa *storedAuth, requested string, body []byte) (*http.Resp
 // catalog serves, that this request has not tried, and that is not cooling on
 // this credential.
 //
-// Free models come first, because a fallback exists to keep a request alive,
-// not to start billing the account. Models the catalog prices but does not
-// describe as free are never chosen. Unknown pricing ranks between the two:
-// most catalogs carry a multiplier, but a bare entry is more likely free than
-// metered, and a request that fails has no cost either.
+// Everything in the pool is believed to cost nothing — the catalog prices it
+// at zero, leaves its price blank, or the operator published it by hand — and
+// the pick rotates across all of it. Ranking those groups and always taking
+// the top one focused every throttled request onto a single spare model and
+// pushed that model over its own burst limit in turn. Spreading is worth more
+// than the ranking. Models the catalog actually prices are never chosen: a
+// fallback exists to keep a request alive, not to start billing the account.
 func nextFallbackModel(sa *storedAuth, tried map[string]struct{}) (string, bool) {
 	catalog := cachedCatalog(sa)
 	credential := accountIdentity(sa)
@@ -153,15 +155,9 @@ func nextFallbackModel(sa *storedAuth, tried map[string]struct{}) (string, bool)
 			unknown = append(unknown, id)
 		}
 	}
-	if id := pickRotating(free); id != "" {
-		return id, true
-	}
-	if id := pickRotating(unknown); id != "" {
-		return id, true
-	}
-	// Last resort: an id the operator published by hand under extra_models.
-	// It is declared rather than discovered, so it ranks below everything the
-	// catalog itself prices.
+	// Last resort: ids the operator published by hand under extra_models.
+	// They are declared rather than discovered, and cost nothing while the
+	// trial they were published for lasts.
 	var declared []string
 	for _, spec := range configuredExtraModels() {
 		id := strings.TrimSpace(spec.ID)
@@ -176,7 +172,12 @@ func nextFallbackModel(sa *storedAuth, tried map[string]struct{}) (string, bool)
 		}
 		declared = append(declared, id)
 	}
-	if id := pickRotating(declared); id != "" {
+
+	pool := make([]string, 0, len(free)+len(declared)+len(unknown))
+	pool = append(pool, free...)
+	pool = append(pool, declared...)
+	pool = append(pool, unknown...)
+	if id := pickRotating(pool); id != "" {
 		return id, true
 	}
 	return "", false
