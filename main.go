@@ -1198,11 +1198,11 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 	if resp.StatusCode >= 400 {
 		payload, _ := io.ReadAll(resp.Body)
 		if resp.StatusCode == http.StatusTooManyRequests {
-			markCooldown(sa, resp)
+			markCooldown(sa, resp, req.Model, payload)
 		}
 		return nil, fmt.Errorf("upstream %d: %s", resp.StatusCode, truncate(string(payload), 200))
 	}
-	clearCooldown(sa)
+	clearCooldown(sa, req.Model)
 	completion, err := aggregateCompletion(resp.Body, req.Model)
 	if err != nil {
 		return nil, err
@@ -1239,7 +1239,7 @@ func handleExecStream(raw []byte) ([]byte, error) {
 
 	// No async stream id → fall back to synchronous chunk collection.
 	if req.StreamID == "" {
-		chunks, errCollect := collectUpstreamStream(body, sa, sseFramed)
+		chunks, errCollect := collectUpstreamStream(body, sa, sseFramed, req.Model)
 		if errCollect != nil {
 			return nil, errCollect
 		}
@@ -1255,7 +1255,7 @@ func handleExecStream(raw []byte) ([]byte, error) {
 		return okEnvelope(streamResponse{Headers: headers})
 	}
 	backendHeaders(httpReq, sa)
-	go pumpUpstreamStream(httpReq, req.StreamID, sseFramed, sa)
+	go pumpUpstreamStream(httpReq, req.StreamID, sseFramed, sa, req.Model)
 	return okEnvelope(streamResponse{Headers: headers})
 }
 
@@ -1271,7 +1271,7 @@ func streamHeaders() http.Header {
 // emits each cleaned chunk to the host stream. It closes the stream when done.
 // An emit failure (client disconnected → host closed the stream) aborts the
 // pump so we stop reading a dead upstream.
-func pumpUpstreamStream(httpReq *http.Request, streamID string, sseFramed bool, sa *storedAuth) {
+func pumpUpstreamStream(httpReq *http.Request, streamID string, sseFramed bool, sa *storedAuth, model string) {
 	resp, err := sharedHTTPClient().Do(httpReq)
 	if err != nil {
 		streamEmitError(streamID, fmt.Sprintf("http_error: %v", err))
@@ -1282,13 +1282,21 @@ func pumpUpstreamStream(httpReq *http.Request, streamID string, sseFramed bool, 
 	if resp.StatusCode >= 400 {
 		errPayload, _ := io.ReadAll(resp.Body)
 		if resp.StatusCode == http.StatusTooManyRequests {
-			markCooldown(sa, resp)
+			markCooldown(sa, resp, model, errPayload)
 		}
+		// The host has no way to surface this text: it reports the empty
+		// stream, not the error we emit. Log it, or the 429 stays invisible.
+		hostLog("warn", "workbuddy: upstream refused the request", map[string]any{
+			"uid":    sa.Account.UID,
+			"model":  cooldownModel(model),
+			"status": resp.StatusCode,
+			"body":   truncate(string(errPayload), 200),
+		})
 		streamEmitError(streamID, fmt.Sprintf("upstream %d: %s", resp.StatusCode, truncate(string(errPayload), 200)))
 		streamClose(streamID)
 		return
 	}
-	clearCooldown(sa)
+	clearCooldown(sa, model)
 	var st upstreamStreamState
 	aborted := false
 	scanner := bufio.NewScanner(resp.Body)
@@ -1335,7 +1343,7 @@ func pumpUpstreamStream(httpReq *http.Request, streamID string, sseFramed bool, 
 
 // collectUpstreamStream is the synchronous fallback (no async stream id): drain
 // the upstream, clean each chunk, return them as a slice.
-func collectUpstreamStream(body []byte, sa *storedAuth, sseFramed bool) ([]pluginapi.ExecutorStreamChunk, error) {
+func collectUpstreamStream(body []byte, sa *storedAuth, sseFramed bool, model string) ([]pluginapi.ExecutorStreamChunk, error) {
 	httpReq, err := http.NewRequest(http.MethodPost, baseFor(sa.Region)+pathChat, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -1349,11 +1357,11 @@ func collectUpstreamStream(body []byte, sa *storedAuth, sseFramed bool) ([]plugi
 	if resp.StatusCode >= 400 {
 		errPayload, _ := io.ReadAll(resp.Body)
 		if resp.StatusCode == http.StatusTooManyRequests {
-			markCooldown(sa, resp)
+			markCooldown(sa, resp, model, errPayload)
 		}
 		return nil, fmt.Errorf("upstream %d: %s", resp.StatusCode, truncate(string(errPayload), 200))
 	}
-	clearCooldown(sa)
+	clearCooldown(sa, model)
 	return aggregateSSE(resp.Body, sseFramed), nil
 }
 

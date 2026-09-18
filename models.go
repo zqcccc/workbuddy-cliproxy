@@ -558,20 +558,22 @@ func modelsForAuth(req pluginapi.AuthModelRequest, sa *storedAuth) []pluginapi.M
 	key := modelCacheKey(req, sa)
 	noteIdentity(accountIdentity(sa))
 
-	// A credential that upstream asked us to back off from stops advertising
-	// models, so the host serves the same id from a different credential.
-	// Deliberately not cached: the list has to come back the moment the
-	// cooldown expires.
-	if suppressModels(sa) {
-		hostLog("info", "workbuddy: credential still cooling, withholding models", map[string]any{
-			"uid": sa.Account.UID,
-		})
+	models := modelCacheLookup(key)
+	if models == nil {
+		models = discoverModels(sa, key)
+	}
+	if len(models) == 0 {
 		return nil
 	}
+	// Applied after the cache, never inside it: a throttled id has to
+	// reappear the moment its backoff expires, and a cached list would pin
+	// the suppressed state for the whole TTL.
+	return withoutThrottledModels(sa, models)
+}
 
-	if cached := modelCacheLookup(key); cached != nil {
-		return cached
-	}
+// discoverModels fetches the catalog, applies the publish policy and the
+// configured extra_models, and caches the result.
+func discoverModels(sa *storedAuth, key string) []pluginapi.ModelInfo {
 	remote, err := fetchRemoteModels(sa)
 	if err != nil || len(remote) == 0 {
 		reason := "empty model list"
@@ -600,6 +602,31 @@ func modelsForAuth(req pluginapi.AuthModelRequest, sa *storedAuth) []pluginapi.M
 		"count": len(models),
 	})
 	return models
+}
+
+// withoutThrottledModels drops the ids upstream throttled on this credential
+// so the host serves them from another credential instead. Upstream rate
+// limits are per model: a 429 on one id says nothing about the rest, and
+// hiding the whole catalog here is what made a single throttled model look
+// like an account with no models at all.
+func withoutThrottledModels(sa *storedAuth, models []pluginapi.ModelInfo) []pluginapi.ModelInfo {
+	kept := make([]pluginapi.ModelInfo, 0, len(models))
+	var dropped []string
+	for _, m := range models {
+		if suppressModel(sa, m.ID) {
+			dropped = append(dropped, m.ID)
+			continue
+		}
+		kept = append(kept, m)
+	}
+	if len(dropped) == 0 {
+		return models
+	}
+	hostLog("info", "workbuddy: withholding throttled models while the credential cools down", map[string]any{
+		"uid":    sa.Account.UID,
+		"models": dropped,
+	})
+	return kept
 }
 
 // applyPublishPolicy drops catalog ids this instance must not claim.
