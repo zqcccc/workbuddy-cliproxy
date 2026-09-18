@@ -698,28 +698,3 @@ func invalidateQuotaCache() {
 // ---------------------------------------------------------------------------
 // Display helpers
 // ---------------------------------------------------------------------------
-
-// maskName hides all but the leading character of a name. The resource route is
-// reachable without management authentication, so the page must not leak
-// account identifiers to whoever can reach the panel host.
-func maskName(name string) string {
-	name = strings.TrimSpace(name)
-	if name == "" {
-		return ""
-	}
-	runes := []rune(name)
-	if len(runes) == 1 {
-		return string(runes) + "*"
-	}
-	return string(runes[0]) + strings.Repeat("*", len(runes)-1)
-}
-
-// shortID keeps a stable, non-identifying prefix of an id.
-func shortID(id string) string {
-	id = strings.TrimSpace(id)
-	runes := []rune(id)
-	if len(runes) <= 8 {
-		return id
-	}
-	return string(runes[:8]) + "…"
-}

@@ -481,27 +481,6 @@ func TestOwnCredentialFiltering(t *testing.T) {
 	}
 }
 
-func TestMasking(t *testing.T) {
-	if got := maskName("知了十八"); got != "知***" {
-		t.Errorf("maskName = %q, want 知***", got)
-	}
-	if got := maskName("a"); got != "a*" {
-		t.Errorf("maskName single = %q", got)
-	}
-	if got := maskName(""); got != "" {
-		t.Errorf("maskName empty = %q", got)
-	}
-	if got := shortID("98e520f0-17bc-4370-a161-1b3885812d84"); got != "98e520f0…" {
-		t.Errorf("shortID = %q", got)
-	}
-	if got := shortID("abc"); got != "abc" {
-		t.Errorf("shortID short = %q", got)
-	}
-}
-
-// TestRenderQuotaHTMLGroupsFreePackages checks the reason api3 is read at all:
-// the refilling free package is listed apart from the purchases, and an
-// account whose backend sends no slice says so instead of showing a zero.
 func TestRenderQuotaHTMLGroupsFreePackages(t *testing.T) {
 	snapshot := quotaSnapshot{
 		GeneratedAt: time.Now(),
@@ -517,7 +496,7 @@ func TestRenderQuotaHTMLGroupsFreePackages(t *testing.T) {
 			},
 		}},
 	}
-	page := renderQuotaHTML(snapshot, false)
+	page := renderQuotaHTML(snapshot)
 	for _, want := range []string{
 		"免费包（周期刷新）", "付费/赠送包", "Pro 月包",
 		"0 / 500", // the slice column
@@ -535,7 +514,7 @@ func TestRenderQuotaHTMLGroupsFreePackages(t *testing.T) {
 	}
 }
 
-func TestRenderQuotaHTMLMaskedAndEscaped(t *testing.T) {
+func TestRenderQuotaHTMLShowsFullInfoAndEscapes(t *testing.T) {
 	snapshot := quotaSnapshot{
 		GeneratedAt: time.Now(),
 		Accounts: []quotaAccount{
@@ -553,15 +532,14 @@ func TestRenderQuotaHTMLMaskedAndEscaped(t *testing.T) {
 			{ID: "x", Label: "过期号", Region: regionGlobal, Error: "登录已过期"},
 		},
 	}
-	page := renderQuotaHTML(snapshot, true)
-	if !strings.Contains(page, "知***") {
-		t.Error("masked page leaks the account name")
+	// The page is a management page: account names and ids show in full, no
+	// masking.
+	page := renderQuotaHTML(snapshot)
+	if !strings.Contains(page, "知了十八") {
+		t.Error("page should show the full account name")
 	}
-	if strings.Contains(page, "98e520f0-17bc-4370-a161") || strings.Contains(page, "知了十八") {
-		t.Error("masked page leaks the account id or full name")
-	}
-	if !strings.Contains(page, "98e520f0…") {
-		t.Error("masked page should still show a short id")
+	if !strings.Contains(page, "98e520f0-17bc-4370-a161-1b3885812d84") {
+		t.Error("page should show the full account uid")
 	}
 	if strings.Contains(page, "<script>alert(1)</script>") {
 		t.Error("package name is not escaped")
@@ -574,10 +552,5 @@ func TestRenderQuotaHTMLMaskedAndEscaped(t *testing.T) {
 	}
 	if !strings.Contains(page, "登录已过期") {
 		t.Error("per-account error missing from page")
-	}
-	// The unmasked copy is what the authenticated JSON path is for; the page
-	// builder must still be able to emit it.
-	if full := renderQuotaHTML(snapshot, false); !strings.Contains(full, "知了十八") {
-		t.Error("unmasked render should keep the full name")
 	}
 }

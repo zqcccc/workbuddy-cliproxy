@@ -371,8 +371,8 @@ b=collections.defaultdict(list);[b[m['owned_by']].append(m['id']) for m in d];pr
 
 - 页面地址:`/v0/resource/plugins/<pluginID>/quota`,例如
   `http://<host>:8317/v0/resource/plugins/workbuddy/quota`
-- 需要原始数据时用鉴权路由:`/v0/management/workbuddy/quota`(Global 插件是
-  `/v0/management/workbuddy-global/quota`),返回 JSON,账号名/uid 不脱敏。
+- 需要 JSON 时用鉴权路由:`/v0/management/workbuddy/quota`(Global 插件是
+  `/v0/management/workbuddy-global/quota`),返回完整数据。
   加 `?refresh=1` 可跳过 60 秒缓存强制重查。
   注意这里要的是 **management key**(`remote-management.secret-key`),`api-keys` 里
   的 `sk-` 是给 `/v1` 用的,拿它访问会 401。
@@ -404,8 +404,8 @@ b=collections.defaultdict(list);[b[m['owned_by']].append(m['id']) for m in d];pr
 4. **面板查询不会刷新 token。** 上游 refresh 会轮换 refresh token,而这条路径不写回
    凭据,轮换后旧 token 就废了。所以过期账号只提示"请重新登录",不会自己去刷。
 
-资源路由按 CPA 的设计**不走管理鉴权**,因此页面上的账号名与 uid 做了脱敏
-(`知***` / `98e520f0…`)。要完整信息请用上面的 `/v0/management/...` JSON 路由。
+资源路由虽然按 CPA 的设计不走管理鉴权,但页面是从面板侧边栏打开的,属于管理页面,
+账号名与 uid 直接完整展示,不做脱敏。
 
 ### 认证文件列表里的额度
 

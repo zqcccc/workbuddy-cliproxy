@@ -4,8 +4,9 @@ package main
 // in the CPA management UI plus a JSON route for programmatic reads.
 //
 //   - resource route  /v0/resource/plugins/<pluginID>/quota  -> HTML page.
-//     These routes are browser-navigable and, per the SDK, are *not*
-//     management-authenticated, so the page masks account names and ids.
+//     Browser-navigable from the panel sidebar; shows account names and ids
+//     in full (the operator decided these are management-only pages, so no
+//     masking).
 //   - management route /v0/management/.../workbuddy/quota    -> full JSON.
 //     This one is behind the management auth the host already enforces.
 
@@ -101,14 +102,15 @@ func handleManagement(raw []byte) ([]byte, error) {
 		"refresh":  force,
 	})
 
-	// Resource routes are public; hand them the masked HTML page. Everything
-	// under /v0/management is already authenticated by the host, so it gets
-	// the complete JSON.
+	// Resource routes are reachable from the panel sidebar without extra auth,
+	// but the page is a management page: the operator decided the account names
+	// and ids it shows need no masking. The management JSON route below stays
+	// the authenticated copy.
 	if isResourcePath(req.Path) {
 		return okEnvelope(pluginapi.ManagementResponse{
 			StatusCode: http.StatusOK,
 			Headers:    http.Header{"Content-Type": []string{"text/html; charset=utf-8"}},
-			Body:       []byte(renderQuotaHTML(snapshot, true)),
+			Body:       []byte(renderQuotaHTML(snapshot)),
 		})
 	}
 	body, err := json.Marshal(snapshot)
@@ -131,7 +133,7 @@ func isResourcePath(path string) bool {
 // renderQuotaHTML builds the balance page. Every value is escaped: account
 // names and package names come from upstream and are attacker-influenced if a
 // credential ever points somewhere unexpected.
-func renderQuotaHTML(snapshot quotaSnapshot, masked bool) string {
+func renderQuotaHTML(snapshot quotaSnapshot) string {
 	var b strings.Builder
 	b.WriteString(`<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">`)
 	b.WriteString(`<meta name="viewport" content="width=device-width,initial-scale=1">`)
@@ -152,10 +154,6 @@ func renderQuotaHTML(snapshot quotaSnapshot, masked bool) string {
 	for _, acc := range snapshot.Accounts {
 		label := acc.Label
 		uid := acc.UID
-		if masked {
-			label = maskName(label)
-			uid = shortID(uid)
-		}
 		b.WriteString(`<section class="card"><header><h2>` + html.EscapeString(label) + `</h2>`)
 		badges := []string{acc.Region}
 		if acc.Plan != "" {
