@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync/atomic"
 )
 
 // Upstream throttles one model at a time, for hours at a stretch, and the host
@@ -152,15 +153,16 @@ func nextFallbackModel(sa *storedAuth, tried map[string]struct{}) (string, bool)
 			unknown = append(unknown, id)
 		}
 	}
-	if len(free) > 0 {
-		return free[0], true
+	if id := pickRotating(free); id != "" {
+		return id, true
 	}
-	if len(unknown) > 0 {
-		return unknown[0], true
+	if id := pickRotating(unknown); id != "" {
+		return id, true
 	}
 	// Last resort: an id the operator published by hand under extra_models.
 	// It is declared rather than discovered, so it ranks below everything the
 	// catalog itself prices.
+	var declared []string
 	for _, spec := range configuredExtraModels() {
 		id := strings.TrimSpace(spec.ID)
 		if id == "" {
@@ -172,9 +174,31 @@ func nextFallbackModel(sa *storedAuth, tried map[string]struct{}) (string, bool)
 		if cooldownRemaining(credential, id) > 0 {
 			continue
 		}
+		declared = append(declared, id)
+	}
+	if id := pickRotating(declared); id != "" {
 		return id, true
 	}
 	return "", false
+}
+
+// fallbackCursor rotates the choice inside one tier.
+var fallbackCursor uint64
+
+// pickRotating spreads repeated fallbacks across a whole tier.
+//
+// Always taking the first entry focuses every throttled request onto one
+// model, which is how a fallback ends up pushing its own substitute over the
+// burst limit: upstream answered 429 for hy3, so every caller landed on
+// hy4-preview-f until that one refused too. Spreading the load keeps each
+// candidate under its own limit. A cursor rather than a random pick keeps the
+// rotation even and the tests deterministic.
+func pickRotating(candidates []string) string {
+	if len(candidates) == 0 {
+		return ""
+	}
+	n := atomic.AddUint64(&fallbackCursor, 1) - 1
+	return candidates[int(n%uint64(len(candidates)))]
 }
 
 // setModelInBody rewrites the model id of an outgoing chat payload.

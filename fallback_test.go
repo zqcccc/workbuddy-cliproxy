@@ -2,6 +2,7 @@ package main
 
 import (
 	"net/http"
+	"sync/atomic"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
@@ -57,6 +58,7 @@ func setExtraModels(t *testing.T, ids ...string) {
 
 func TestNextFallbackModelPrefersFreeAndSkipsCooling(t *testing.T) {
 	setExtraModels(t)
+	atomic.StoreUint64(&fallbackCursor, 0)
 	sa := auth("uid-fallback")
 	seedCatalog(t, sa,
 		upstreamModel{ID: "gpt-5.6-terra", Credits: "x1.39 credits"},
@@ -91,6 +93,36 @@ func TestNextFallbackModelPrefersFreeAndSkipsCooling(t *testing.T) {
 	setExtraModels(t, "hy4-preview-f")
 	if id, ok := nextFallbackModel(sa, map[string]struct{}{}); !ok || id != "hy4-preview-f" {
 		t.Fatalf("got %q, want the configured extra model", id)
+	}
+}
+
+func TestFallbackRotatesAcrossCandidates(t *testing.T) {
+	setExtraModels(t)
+	atomic.StoreUint64(&fallbackCursor, 0)
+	sa := auth("uid-rotate")
+	seedCatalog(t, sa,
+		upstreamModel{ID: "hy3", Credits: "x0.00"},
+		upstreamModel{ID: "hy4-preview", Credits: "x0.00"},
+		upstreamModel{ID: "gpt-5.6-terra", Credits: "x1.39 credits"},
+	)
+
+	// Repeated fallbacks must not all land on the same id: that is what pushed
+	// the substitute model over its own burst limit.
+	picked := map[string]int{}
+	for i := 0; i < 4; i++ {
+		id, ok := nextFallbackModel(sa, map[string]struct{}{})
+		if !ok {
+			t.Fatal("expected a candidate")
+		}
+		picked[id]++
+	}
+	if len(picked) != 2 {
+		t.Fatalf("fallback kept choosing the same id: %v", picked)
+	}
+	for id := range picked {
+		if id == "gpt-5.6-terra" {
+			t.Fatal("rotated onto a priced model")
+		}
 	}
 }
 
