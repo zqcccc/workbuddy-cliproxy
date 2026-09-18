@@ -58,16 +58,22 @@ func sendWithFallback(sa *storedAuth, requested string, body []byte) (*http.Resp
 	// one that can still answer.
 	if cooldownRemaining(accountIdentity(sa), model) > 0 {
 		tried[model] = struct{}{}
-		if next, ok := nextFallbackModel(sa, tried); ok {
-			hostLog("warn", "workbuddy: requested model is throttled, answering with another model", map[string]any{
-				"uid":  sa.Account.UID,
-				"from": model,
-				"to":   next,
-			})
-			model = next
-			tried[model] = struct{}{}
-			body = setModelInBody(body, model)
+		next, ok := nextFallbackModel(sa, tried)
+		if !ok {
+			// Nothing left to try, and upstream already told us to stop. Asking
+			// again would only deepen the throttle: a retrying client can turn
+			// one 429 into dozens.
+			return nil, model, fmt.Errorf("upstream 429: %s",
+				firstNonEmpty(cooldownReason(accountIdentity(sa), model), "throttled, no other model available"))
 		}
+		hostLog("warn", "workbuddy: requested model is throttled, answering with another model", map[string]any{
+			"uid":  sa.Account.UID,
+			"from": model,
+			"to":   next,
+		})
+		model = next
+		tried[model] = struct{}{}
+		body = setModelInBody(body, model)
 	}
 
 	for attempt := 0; ; attempt++ {
@@ -123,9 +129,13 @@ func nextFallbackModel(sa *storedAuth, tried map[string]struct{}) (string, bool)
 	catalog := cachedCatalog(sa)
 	credential := accountIdentity(sa)
 	var free, unknown []string
+	seen := map[string]struct{}{}
 	for _, m := range catalog {
 		id := strings.TrimSpace(m.ID)
 		if id == "" || isServiceModel(id) {
+			continue
+		}
+		if _, dup := seen[id]; dup {
 			continue
 		}
 		if _, skip := tried[id]; skip {
@@ -134,6 +144,7 @@ func nextFallbackModel(sa *storedAuth, tried map[string]struct{}) (string, bool)
 		if cooldownRemaining(credential, id) > 0 {
 			continue
 		}
+		seen[id] = struct{}{}
 		switch {
 		case m.isFree():
 			free = append(free, id)
@@ -146,6 +157,22 @@ func nextFallbackModel(sa *storedAuth, tried map[string]struct{}) (string, bool)
 	}
 	if len(unknown) > 0 {
 		return unknown[0], true
+	}
+	// Last resort: an id the operator published by hand under extra_models.
+	// It is declared rather than discovered, so it ranks below everything the
+	// catalog itself prices.
+	for _, spec := range configuredExtraModels() {
+		id := strings.TrimSpace(spec.ID)
+		if id == "" {
+			continue
+		}
+		if _, skip := tried[id]; skip {
+			continue
+		}
+		if cooldownRemaining(credential, id) > 0 {
+			continue
+		}
+		return id, true
 	}
 	return "", false
 }

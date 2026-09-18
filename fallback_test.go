@@ -35,7 +35,28 @@ func TestIsFreeReadsTheCatalogMultiplier(t *testing.T) {
 	}
 }
 
+// setExtraModels pins the operator-declared extras for one test. Config lives
+// in package state, so a test that leaves it set would change what another
+// test's fallback can pick.
+func setExtraModels(t *testing.T, ids ...string) {
+	t.Helper()
+	specs := make([]extraModelSpec, 0, len(ids))
+	for _, id := range ids {
+		specs = append(specs, extraModelSpec{upstreamModel{ID: id}})
+	}
+	cfgMu.Lock()
+	previous := cfgExtraModels
+	cfgExtraModels = specs
+	cfgMu.Unlock()
+	t.Cleanup(func() {
+		cfgMu.Lock()
+		cfgExtraModels = previous
+		cfgMu.Unlock()
+	})
+}
+
 func TestNextFallbackModelPrefersFreeAndSkipsCooling(t *testing.T) {
+	setExtraModels(t)
 	sa := auth("uid-fallback")
 	seedCatalog(t, sa,
 		upstreamModel{ID: "gpt-5.6-terra", Credits: "x1.39 credits"},
@@ -58,10 +79,18 @@ func TestNextFallbackModelPrefersFreeAndSkipsCooling(t *testing.T) {
 		t.Fatalf("got %q, want hy3 after the throttled id", got)
 	}
 
-	// Nothing left to try: every free id is parked.
+	// Nothing left to try: every free id is parked, and the priced one stays
+	// out of it either way.
 	markCooldown(sa, &http.Response{StatusCode: 429, Header: http.Header{}}, "hy3", nil)
-	if _, ok := nextFallbackModel(sa, map[string]struct{}{}); ok {
-		t.Fatal("should not fall back to a priced model")
+	if id, ok := nextFallbackModel(sa, map[string]struct{}{}); ok {
+		t.Fatalf("should not fall back to a priced model, got %q", id)
+	}
+
+	// A hand-published id is the last resort, after everything the catalog
+	// prices as free.
+	setExtraModels(t, "hy4-preview-f")
+	if id, ok := nextFallbackModel(sa, map[string]struct{}{}); !ok || id != "hy4-preview-f" {
+		t.Fatalf("got %q, want the configured extra model", id)
 	}
 }
 

@@ -41,6 +41,10 @@ type cooldownState struct {
 	until    time.Time
 	failures int
 	model    string
+	// reason is what upstream said when it refused. Kept so a request that
+	// arrives during the cooldown can be turned down without asking upstream
+	// again — and so the log explains the refusal.
+	reason string
 }
 
 // noteIdentity records that a credential exists, so we can tell whether any
@@ -88,11 +92,13 @@ func markCooldown(sa *storedAuth, resp *http.Response, model string, body []byte
 
 	credential := accountIdentity(sa)
 	key := cooldownKey(credential, id)
+	why := upstreamReason(body)
 
 	cdMu.Lock()
 	st := cooling[key]
 	st.failures++
 	st.model = id
+	st.reason = why
 	if wait <= 0 {
 		shift := st.failures - 1
 		if shift > 5 {
@@ -121,8 +127,8 @@ func markCooldown(sa *storedAuth, resp *http.Response, model string, body []byte
 	if resp != nil {
 		fields["status"] = resp.StatusCode
 	}
-	if reason := upstreamReason(body); reason != "" {
-		fields["reason"] = reason
+	if why != "" {
+		fields["reason"] = why
 	}
 	hostLog("warn", "workbuddy: model cooling down after upstream backoff", fields)
 }
@@ -152,6 +158,14 @@ func cooldownRemaining(credential, model string) time.Duration {
 		return 0
 	}
 	return time.Until(st.until)
+}
+
+// cooldownReason returns what upstream said when it throttled this model, or
+// an empty string when nothing is on record.
+func cooldownReason(credential, model string) string {
+	cdMu.Lock()
+	defer cdMu.Unlock()
+	return cooling[cooldownKey(credential, model)].reason
 }
 
 // suppressModel reports whether this credential should stop advertising one

@@ -539,10 +539,12 @@ func modelCacheStore(key string, models []pluginapi.ModelInfo) {
 	modelCache.entries[key] = &modelCacheEntry{models: models, expires: time.Now().Add(modelCacheTTL)}
 }
 
-// modelCacheRememberRemote attaches the raw catalog ids to the cached entry so
-// a request can later be checked against what upstream really serves. It is a
-// separate call from modelCacheStore to keep that signature untouched; the ids
-// live as long as the models they came from.
+// modelCacheRememberRemote attaches the raw catalog to the cached entry — the
+// full list upstream served, before the publish policy trimmed it — so a
+// request can later be checked against what upstream really serves and a
+// throttled model can fall back to any id the account can use. It is a
+// separate call from modelCacheStore to keep that signature untouched; the
+// catalog lives as long as the models it produced.
 func modelCacheRememberRemote(key string, remote []upstreamModel) {
 	ids := make(map[string]struct{}, len(remote))
 	for _, m := range remote {
@@ -635,10 +637,15 @@ func discoverModels(sa *storedAuth, key string) []pluginapi.ModelInfo {
 		}
 		return fallbackModels()
 	}
+	// The publish policy decides what we advertise. It must not limit what a
+	// fallback may use: an id kept out of the advertised list is still one the
+	// account can serve, and it is exactly what keeps a request alive when the
+	// two or three published ids are the ones being throttled.
+	full := remote
 	remote = applyPublishPolicy(remote, sa)
 	models := appendExtraModels(toModelInfos(remote), remote)
 	modelCacheStore(key, models)
-	modelCacheRememberRemote(key, remote)
+	modelCacheRememberRemote(key, full)
 	hostLog("info", "workbuddy: model discovery succeeded", map[string]any{
 		"uid":   sa.Account.UID,
 		"count": len(models),
