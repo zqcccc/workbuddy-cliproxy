@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -49,6 +50,30 @@ type upstreamModel struct {
 	SupportsReasoning bool           `json:"supportsReasoning" yaml:"supportsReasoning"`
 	OnlyReasoning     bool           `json:"onlyReasoning" yaml:"onlyReasoning"`
 	IsDefault         bool           `json:"isDefault" yaml:"isDefault"`
+	// Credits is the billing multiplier the catalog publishes, rendered as
+	// "x0.00", "x3.31 credits" or "x0.00" for a free model. It is what tells
+	// a free fallback apart from one that would bill the account.
+	Credits string `json:"credits" yaml:"credits"`
+}
+
+// isFree reports whether the catalog bills nothing for this model. The
+// multiplier is what /v3/config publishes per id: "x0.00" costs nothing,
+// anything else is a multiple of a credit.
+func (m upstreamModel) isFree() bool {
+	token := strings.TrimSpace(m.Credits)
+	if token == "" {
+		return false
+	}
+	token = strings.TrimPrefix(token, "x")
+	token = strings.TrimPrefix(token, "X")
+	if i := strings.IndexByte(token, ' '); i >= 0 {
+		token = token[:i]
+	}
+	value, err := strconv.ParseFloat(token, 64)
+	if err != nil {
+		return false
+	}
+	return value == 0
 }
 
 // contextWindow is the newer selectable context-budget block the catalog
@@ -481,6 +506,9 @@ type modelCacheEntry struct {
 	// id we publish on our own: upstream answers unknown ids with a silent
 	// fallback to its default backend instead of an error.
 	remoteIDs map[string]struct{}
+	// remote is the catalog itself, kept in upstream order. The request path
+	// reads it to find another model when the requested one is throttled.
+	remote []upstreamModel
 }
 
 var modelCache = struct {
@@ -530,6 +558,20 @@ func modelCacheRememberRemote(key string, remote []upstreamModel) {
 		modelCache.entries[key] = entry
 	}
 	entry.remoteIDs = ids
+	entry.remote = remote
+}
+
+// cachedCatalog returns the catalog upstream served for this account, in
+// upstream order. It is empty until discovery has run once.
+func cachedCatalog(sa *storedAuth) []upstreamModel {
+	key := modelCacheKey(pluginapi.AuthModelRequest{}, sa)
+	modelCache.mu.Lock()
+	defer modelCache.mu.Unlock()
+	entry := modelCache.entries[key]
+	if entry == nil || time.Now().After(entry.expires) {
+		return nil
+	}
+	return entry.remote
 }
 
 // catalogKnowsModel reports whether id is in the account's upstream catalog.
