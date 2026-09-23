@@ -107,9 +107,10 @@ jobs:
 
             Artifacts: workbuddy{,-global}-<goos>-<goarch>.so
 
-            The deploy webhook installs workbuddy-linux-amd64.so and
-            workbuddy-global-linux-amd64.so as plugins/workbuddy.so and
-            plugins/workbuddy-global.so.
+            The deploy webhook installs the pair matching the host's own
+            PLATFORM (linux-amd64 on x86_64, linux-arm64 on aarch64) as
+            plugins/workbuddy.so and plugins/workbuddy-global.so; the other
+            pair in the payload is ignored.
           prerelease: ${{ github.ref == 'refs/heads/main' }}
           files: |
             dist/*.so
