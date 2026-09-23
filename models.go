@@ -150,6 +150,44 @@ func isServiceModel(id string) bool {
 	return false
 }
 
+// routingAliasIDs catches alias ids that upstream ships without the isDefault
+// flag. `default` is deliberately absent: CN catalogs `default` as a priced
+// option (x2.00 credits, isDefault null) that a user may legitimately pick, so
+// the proxy forwards it rather than suppressing it. The isDefault flag below
+// already covers every entry upstream marks as its "pick one for me" alias
+// (global default-model, CN auto), and this list adds the spelled variants that
+// lack the flag (auto-chat).
+var routingAliasIDs = map[string]struct{}{
+	"auto":          {},
+	"auto-chat":     {},
+	"default-model": {},
+}
+
+// isRoutingAlias reports whether upstream lists this id not as a model but as
+// its own "pick a model for me" entry. Both realms ship one, under different
+// ids (Global: default-model, CN: auto), and both mark it isDefault.
+//
+// Such an id must never be chosen automatically by anything that wants to
+// control cost: upstream answers with a backend of its own choosing, so the
+// price, the context window and even the vendor are unknown until the stream
+// arrives. Measured per realm — Global's alias answered as glm-5.2 (x0.79,
+// billed), CN's as hy4-preview-f.
+//
+// A blank price is the symptom, not the reason: the catalog leaves `credits`
+// empty for these because they are not priced objects at all, so an empty
+// price must never be read as "free".
+//
+// This is about the proxy picking one on its own, not about what a user may
+// ask for. An id upstream prices and lists (CN's `default`, x2.00 credits) is
+// a real offering: a client that names it gets it forwarded, cost and all.
+func isRoutingAlias(m upstreamModel) bool {
+	if m.IsDefault {
+		return true
+	}
+	_, ok := routingAliasIDs[strings.ToLower(strings.TrimSpace(m.ID))]
+	return ok
+}
+
 // v3ConfigData is the subset of /v3/config data we care about.
 type v3ConfigData struct {
 	Models json.RawMessage `json:"models"`
@@ -456,7 +494,7 @@ func normalizeContextLengths(lengths []int64, maxInputTokens int64) []int64 {
 func toModelInfos(models []upstreamModel) []pluginapi.ModelInfo {
 	out := make([]pluginapi.ModelInfo, 0, len(models))
 	for _, m := range models {
-		if m.ID == "" || isServiceModel(m.ID) {
+		if m.ID == "" || isServiceModel(m.ID) || isRoutingAlias(m) {
 			continue
 		}
 		display := m.Name
@@ -624,18 +662,21 @@ func discoverModels(sa *storedAuth, key string) []pluginapi.ModelInfo {
 		if err != nil {
 			reason = err.Error()
 		}
-		hostLog("warn", "workbuddy: model discovery failed, using built-in fallback", map[string]any{
+		// Nothing is advertised. A bundled list cannot stand in for the
+		// catalog: every id it used to carry is either billed on one realm
+		// (glm-5v-turbo x0.71, kimi-k2.5 x0.45, gpt-5.5 x3.31,
+		// gemini-3.5-flash x0.99) or absent from both (deepseek-v3.2), and
+		// upstream answers an id it does not know by routing to a default
+		// backend after billing the request. Publishing one would hand a
+		// client a model this account may not serve, at a price neither side
+		// can name. Staying silent until discovery recovers is the honest
+		// answer; the host then reports an unknown model instead of billing
+		// a request that was never meant to land here.
+		hostLog("warn", "workbuddy: model discovery failed, advertising nothing", map[string]any{
 			"uid":   sa.Account.UID,
 			"error": reason,
 		})
-		// The fallback list is shared ids (gpt-5.5, gemini-3.5-flash, ...),
-		// exactly the ones publish_mode=allow exists to give up. Advertising
-		// them blind would claim traffic that belongs to another provider, so
-		// an allow-list instance stays silent until discovery recovers.
-		if mode, _ := configuredPublish(); mode == "allow" {
-			return nil
-		}
-		return fallbackModels()
+		return nil
 	}
 	// The publish policy decides what we advertise. It must not limit what a
 	// fallback may use: an id kept out of the advertised list is still one the
@@ -758,7 +799,7 @@ func appendExtraModels(models []pluginapi.ModelInfo, remote []upstreamModel) []p
 	for _, spec := range extra {
 		m := spec.upstreamModel
 		id := strings.TrimSpace(m.ID)
-		if id == "" || isServiceModel(id) {
+		if id == "" || isServiceModel(id) || isRoutingAlias(m) {
 			continue
 		}
 		if _, ok := seen[id]; ok {
@@ -861,46 +902,11 @@ var measuredModels = map[string]upstreamModel{
 		SupportsReasoning: true,
 	}, // source: CN /v3/config, account 98e520f0, 2026-09-12
 	"hy4-preview-x": {
-		ID: "hy4-preview-x", Name: "Hy4 preview",
+		ID:                "hy4-preview-x",
+		Name:              "Hy4 preview",
 		MaxInputTokens:    1000000,
 		MaxOutputTokens:   64000,
 		SupportsImages:    true,
 		SupportsReasoning: true,
 	}, // source: CN /v3/config, account 0fd66171, 2026-09-12
-}
-
-// fallbackModels is the bundled catalog used for model.static (no credentials
-// available) and whenever remote discovery fails.
-func fallbackModels() []pluginapi.ModelInfo {
-	specs := []struct {
-		id            string
-		name          string
-		contextLength int64
-		maxCompletion int64
-	}{
-		{"default-model", "Default", 176000, 24000},
-		{"auto-chat", "Auto", 168000, 32000},
-		{"glm-5v-turbo", "GLM-5v-Turbo", 200000, 38000},
-		{"kimi-k2.5", "Kimi-K2.5", 256000, 32000},
-		{"deepseek-v3.2", "DeepSeek-V3.2", 96000, 32000},
-		{"gpt-5.5", "GPT-5.5", 1000000, 72000},
-		{"gemini-3.5-flash", "Gemini-3.5-Flash", 1000000, 65536},
-	}
-	models := make([]pluginapi.ModelInfo, 0, len(specs))
-	for _, m := range specs {
-		models = append(models, pluginapi.ModelInfo{
-			ID:                         m.id,
-			Object:                     "model",
-			OwnedBy:                    providerName,
-			DisplayName:                m.name,
-			Name:                       m.id,
-			SupportedGenerationMethods: []string{"chat"},
-			ContextLength:              m.contextLength,
-			MaxCompletionTokens:        m.maxCompletion,
-			SupportedInputModalities:   []string{"text"},
-			SupportedOutputModalities:  []string{"text"},
-			UserDefined:                true,
-		})
-	}
-	return models
 }

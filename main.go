@@ -414,11 +414,9 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return okEnvelope(struct{}{})
 	case pluginabi.MethodModelStatic:
 		// The catalog lives behind a credential, so model.for_auth is the only
-		// authoritative source. Advertising a bundled list here would publish
-		// models that no credential can actually serve, and clients calling
-		// them get "no auth available" instead of a clear "unknown model".
-		// fallbackModels() is still used by model.for_auth when the catalog
-		// cannot be fetched, so offline behaviour is unchanged.
+		// authoritative source. A bundled list would publish models that no
+		// credential can serve, and clients calling them get "no auth
+		// available" instead of a clear "unknown model".
 		return okEnvelope(pluginapi.ModelResponse{Provider: providerName})
 	case pluginabi.MethodModelForAuth:
 		return handleModelsForAuth(request)
@@ -510,9 +508,11 @@ func wbRegistration() registration {
 	}
 }
 
-// handleModelsForAuth resolves the live per-account catalog. A broken or
-// unrecognised credential must not take the provider down, so it degrades to
-// the bundled fallback list instead of erroring out.
+// handleModelsForAuth resolves the live per-account catalog. A credential the
+// plugin cannot read is reported as an account with no models rather than
+// degraded to a bundled list: every id a bundle could name is either billed or
+// absent from the realm's catalog, and advertising one would invite a client
+// to send a request upstream would answer by routing somewhere it chose.
 func handleModelsForAuth(raw []byte) ([]byte, error) {
 	var req pluginapi.AuthModelRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
@@ -523,7 +523,7 @@ func handleModelsForAuth(raw []byte) ([]byte, error) {
 		hostLog("warn", "workbuddy: model.for_auth could not read stored credential", map[string]any{
 			"error": err.Error(),
 		})
-		return okEnvelope(pluginapi.ModelResponse{Provider: providerName, Models: fallbackModels()})
+		return okEnvelope(pluginapi.ModelResponse{Provider: providerName})
 	}
 	return okEnvelope(pluginapi.ModelResponse{Provider: providerName, Models: modelsForAuth(req, sa)})
 }

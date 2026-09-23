@@ -138,3 +138,48 @@ func TestSetModelInBodyRewritesOnlyTheModel(t *testing.T) {
 		t.Fatal("non-JSON payload should pass through unchanged")
 	}
 }
+
+// TestNextFallbackModelSkipsRoutingAlias covers upstream's "pick a backend for
+// me" entries. Global ships it as default-model, CN as auto; both carry
+// isDefault and a blank price. Upstream answers them with a backend of its own
+// choosing — measured as glm-5.2 at x0.79 — so a fallback must never name one.
+//
+// Both are priced x0.00 here on purpose: an alias must be rejected for being
+// an alias, not for being expensive. A fix that only filtered on price would
+// let these through.
+func TestNextFallbackModelSkipsRoutingAlias(t *testing.T) {
+	setExtraModels(t)
+	atomic.StoreUint64(&fallbackCursor, 0)
+	sa := auth("uid-alias")
+	seedCatalog(t, sa,
+		upstreamModel{ID: "default-model", Name: "Auto", IsDefault: true, Credits: "x0.00"},
+		upstreamModel{ID: "auto", Name: "Auto", IsDefault: true, Credits: "x0.00"},
+		upstreamModel{ID: "hy3", Credits: "x0.00"},
+	)
+
+	// Repeated draws must never surface an alias, however it is priced.
+	for range 6 {
+		got, ok := nextFallbackModel(sa, map[string]struct{}{})
+		if !ok || got != "hy3" {
+			t.Fatalf("got %q, want hy3", got)
+		}
+	}
+}
+
+// TestNextFallbackModelSkipsBlankPrice covers the other half: the catalog
+// leaves `credits` empty for entries it does not price, and a blank price is
+// not a free price. Only an explicit x0.00 may be used as a fallback.
+func TestNextFallbackModelSkipsBlankPrice(t *testing.T) {
+	setExtraModels(t)
+	atomic.StoreUint64(&fallbackCursor, 0)
+	sa := auth("uid-blank")
+	seedCatalog(t, sa,
+		upstreamModel{ID: "some-unpriced", Credits: ""},
+		upstreamModel{ID: "hy3", Credits: "x0.00"},
+	)
+
+	got, ok := nextFallbackModel(sa, map[string]struct{}{})
+	if !ok || got != "hy3" {
+		t.Fatalf("got %q, want hy3", got)
+	}
+}

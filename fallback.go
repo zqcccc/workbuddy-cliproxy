@@ -122,20 +122,25 @@ func sendWithFallback(sa *storedAuth, requested string, body []byte) (*http.Resp
 // this credential.
 //
 // Everything in the pool is believed to cost nothing — the catalog prices it
-// at zero, leaves its price blank, or the operator published it by hand — and
-// the pick rotates across all of it. Ranking those groups and always taking
-// the top one focused every throttled request onto a single spare model and
-// pushed that model over its own burst limit in turn. Spreading is worth more
-// than the ranking. Models the catalog actually prices are never chosen: a
-// fallback exists to keep a request alive, not to start billing the account.
+// at zero, or the operator published it by hand — and the pick rotates across
+// all of it. Ranking those groups and always taking the top one focused every
+// throttled request onto a single spare model and pushed that model over its
+// own burst limit in turn. Spreading is worth more than the ranking. Models
+// the catalog actually prices are never chosen: a fallback exists to keep a
+// request alive, not to start billing the account.
+//
+// A blank price is not a free price. The catalog leaves `credits` empty for
+// the ids it does not price at all, and upstream answers those by routing to
+// a backend of its own choosing — measured at x0.79 on the Global realm. Only
+// an explicit x0.00 is free; anything else, including blank, stays out.
 func nextFallbackModel(sa *storedAuth, tried map[string]struct{}) (string, bool) {
 	catalog := cachedCatalog(sa)
 	credential := accountIdentity(sa)
-	var free, unknown []string
+	var free []string
 	seen := map[string]struct{}{}
 	for _, m := range catalog {
 		id := strings.TrimSpace(m.ID)
-		if id == "" || isServiceModel(id) {
+		if id == "" || isServiceModel(id) || isRoutingAlias(m) {
 			continue
 		}
 		if _, dup := seen[id]; dup {
@@ -148,11 +153,8 @@ func nextFallbackModel(sa *storedAuth, tried map[string]struct{}) (string, bool)
 			continue
 		}
 		seen[id] = struct{}{}
-		switch {
-		case m.isFree():
+		if m.isFree() {
 			free = append(free, id)
-		case strings.TrimSpace(m.Credits) == "":
-			unknown = append(unknown, id)
 		}
 	}
 	// Last resort: ids the operator published by hand under extra_models.
@@ -173,10 +175,9 @@ func nextFallbackModel(sa *storedAuth, tried map[string]struct{}) (string, bool)
 		declared = append(declared, id)
 	}
 
-	pool := make([]string, 0, len(free)+len(declared)+len(unknown))
+	pool := make([]string, 0, len(free)+len(declared))
 	pool = append(pool, free...)
 	pool = append(pool, declared...)
-	pool = append(pool, unknown...)
 	if id := pickRotating(pool); id != "" {
 		return id, true
 	}

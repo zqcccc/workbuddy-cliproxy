@@ -208,15 +208,28 @@ func TestRealCatalogContextWindow(t *testing.T) {
   "maxAllowedSize":1000000,"maxInputTokens":1000000,"maxOutputTokens":64000,
   "name":"Hy4 preview","supportsReasoning":true,"supportsToolCall":true,"vendor":"j"},
  {"credits":"x0.57","id":"hy3","maxAllowedSize":192000,"maxInputTokens":192000,
-  "maxOutputTokens":64000,"name":"Hy3","supportsToolCall":true,"vendor":"j"}
+  "maxOutputTokens":64000,"name":"Hy3","supportsToolCall":true,"vendor":"j"},
+ {"credits":"","id":"default-model","isDefault":true,"name":"Auto",
+  "maxInputTokens":176000,"maxOutputTokens":24000,"supportsImages":true,
+  "supportsToolCall":true,"vendor":"e"}
 ]`
-	models := toModelInfos(extractModels(json.RawMessage(`{"models":` + globalCatalog + `}`)))
+	raw := extractModels(json.RawMessage(`{"models":` + globalCatalog + `}`))
+	// The isDefault tag has to survive decoding for the alias filter to work.
+	// A struct literal in another test would not catch a mistyped json tag.
+	decoded := map[string]bool{}
+	for _, m := range raw {
+		decoded[m.ID] = m.IsDefault
+	}
+	if !decoded["default-model"] {
+		t.Fatalf("isDefault did not decode: %v", raw)
+	}
+	models := toModelInfos(raw)
 	byID := map[string]pluginapi.ModelInfo{}
 	for _, m := range models {
 		byID[m.ID] = m
 	}
 	if len(models) != 3 {
-		t.Fatalf("published %d models, want 3", len(models))
+		t.Fatalf("published %d models, want 3 (default-model must be dropped)", len(models))
 	}
 	// The default window, not the 1M hard cap, is what this account can serve.
 	for id, want := range map[string]int64{"deepseek-v4.1-flash": 300000, "hy4-preview": 200000, "hy3": 192000} {
@@ -230,6 +243,28 @@ func TestRealCatalogContextWindow(t *testing.T) {
 	}
 }
 
+// TestToModelInfosHidesRoutingAlias keeps upstream's "pick a backend for me"
+// entries out of the published list. Global's default-model and CN's auto both
+// carry isDefault; a priced id a user may pick (CN's `default`, x2.00 credits)
+// must still be published — only the isDefault aliases are suppressed.
+func TestToModelInfosHidesRoutingAlias(t *testing.T) {
+	models := toModelInfos([]upstreamModel{
+		{ID: "default-model", Name: "Auto", IsDefault: true},
+		{ID: "auto", Name: "Auto", IsDefault: true},
+		{ID: "default", Name: "Default", Credits: "x2.00 credits"},
+		{ID: "hy3", Name: "Hy3"},
+	})
+	got := map[string]bool{}
+	for _, m := range models {
+		got[m.ID] = true
+	}
+	if got["default-model"] || got["auto"] {
+		t.Fatalf("alias leaked into published list: %v", models)
+	}
+	if !got["default"] || !got["hy3"] {
+		t.Fatalf("priced id wrongly suppressed: %v", models)
+	}
+}
 func TestRealCatalog(t *testing.T) {
 	models := toModelInfos(extractModels(json.RawMessage(`{"models":` + realCatalog + `}`)))
 
@@ -271,18 +306,6 @@ func TestRealCatalog(t *testing.T) {
 	for _, m := range models {
 		if m.ID == "deepseek-v3.2" && len(m.SupportedInputModalities) != 1 {
 			t.Errorf("deepseek-v3.2 is text-only, modalities = %v", m.SupportedInputModalities)
-		}
-	}
-}
-
-func TestFallbackModels(t *testing.T) {
-	models := fallbackModels()
-	if len(models) != 7 {
-		t.Fatalf("fallback models = %d, want 7", len(models))
-	}
-	for _, m := range models {
-		if m.ID == "" || m.OwnedBy != providerName || m.Object != "model" {
-			t.Errorf("model %+v missing required fields", m)
 		}
 	}
 }

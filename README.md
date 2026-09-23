@@ -107,9 +107,11 @@ plugins:
    各自都列了对方没有的模型:`/v3/config` 有 `hy4-preview-f` 但没有 `hy4-preview-x`,
    控制台有 `hy4-preview-x` / `auto` 且是唯一带 `contextWindow` 可选预算的那个。
    谁都不是对方超集,只读一个会静默丢掉账号其实能用的模型。
-3. 都失败(网络不通 / token 失效 / 上游改结构)才用内置兜底列表:
-   `default-model` · `auto-chat` · `glm-5v-turbo` · `kimi-k2.5` · `deepseek-v3.2` ·
-   `gpt-5.5` · `gemini-3.5-flash`
+3. 都失败(网络不通 / token 失效 / 上游改结构)时**不发任何模型**:返回空列表,
+   等待下一次发现恢复。旧版本硬编码了一份"通用"兜底目录,但里面每一项要么在
+   至少一个区按积分计费(glm-5v-turbo x0.71、kimi-k2.5 x0.45、gpt-5.5 x3.31、
+   gemini-3.5-flash x0.99),要么两区目录都已不存在(deepseek-v3.2),上游对未知
+   id 会静默路由到自己的默认后端再计费,所以已整体删除。
 
 合并时同一 id 取**信息更全**的那条(带 `contextWindow` 的赢),顺序不敏感。
 
@@ -138,8 +140,8 @@ suggestion、提示词增强,不能走 chat completions)。
 
 - `model.static` 返回空列表。模型目录在凭据后面,没有凭据就没有可用模型;如果这里再吐一份
   内置列表,`/v1/models` 会列出没有任何凭据能服务的模型,客户端一调用就得到
-  `auth_not_found: no auth available`。所以目录只由 `model.for_auth` 提供,内置列表保留为
-  `model.for_auth` 拉取失败时的兜底(此时它挂在该凭据下,是可路由的)。
+  `auth_not_found: no auth available`。所以目录只由 `model.for_auth` 提供,而它在
+  拉取失败时同样返回空列表,不再有内置兜底(见上文「模型」一节)。
 - 上游给的字段缺失时才用默认值(上下文 200000、输出 8192)。
 
 ### 上下文窗口怎么算
@@ -328,8 +330,9 @@ force-model-prefix: true
 
 - `publish_mode: catalog`(默认)发全目录;`allow` 只发 `extra_models` + `publish_allow`。
 - `publish_allow` 只是"从目录里挑",不会凭空造 id;目录里没有的写了也不出现。
-- `allow` 模式下目录拉取失败时**不再回落内置兜底列表**(兜底那几个 id 全是共享 id,
-  盲发等于抢注),此时插件暂时不报任何模型,等目录恢复。
+- 目录拉取失败时**一律不发任何模型**(与 `publish_mode` 无关):插件暂时不报模型,
+  等目录恢复。旧版本会回落一份内置兜底列表,那份列表里的 id 要么计费、要么两区
+  目录都不存在,已删除。
 
 验证方式(改完看有没有让出 id):
 
@@ -354,10 +357,16 @@ b=collections.defaultdict(list);[b[m['owned_by']].append(m['id']) for m in d];pr
 `model.for_auth` 返回空模型让宿主改选别的凭证。冷却期间不会打上游,不会加重限流。
 
 > **注意**:旧的硬编码列表(`hy3` / `hy3-preview` / `hy3-preview-agent` / `glm-5.2` /
-> `glm-5.1` / `kimi-k2.7` / `minimax-m3-pay` / `deepseek-v4-*`)在当前目录里已全部不存在,
-> 实测目录是 `default-model` / `auto-chat` / `glm-5v-turbo` / `kimi-k2.5` / `deepseek-v3.2` /
-> `gpt-5.x` / `gemini-3.x` 这一批。兜底列表和 README 已同步更新。因此下面「思考模式」一节
-> 里关于 hy3 的描述目前是死代码(账号若仍有 hy3 权限则照常生效)。
+> `glm-5.1` / `kimi-k2.7` / `minimax-m3-pay` / `deepseek-v4-*`)在当前目录里已全部不存在。
+> 后来硬编码的"通用兜底"(`glm-5v-turbo` / `kimi-k2.5` / `deepseek-v3.2` /
+> `gpt-5.5` / `gemini-3.5-flash`)也已删除:每一项至少在一个区计费,三个两区都已不存在。
+> 现在发现失败时直接返回空目录,不再发任何模型。因此下面「思考模式」一节里关于
+> hy3 的描述目前是死代码(账号若仍有 hy3 权限则照常生效)。
+>
+> 两区目录里各有一条"自动选择"入口(国际版 `default-model`、国内版 `auto`,都带
+> `isDefault`),它们是 App 里的菜单项而非模型:上游会自己挑后端,价格与能力都不可控。
+> 插件不发布、不用它们兜底,见 `isRoutingAlias()`。注意国内版还有个 `default`
+> (标价 x2.00、无 `isDefault`),那是**用户可主动选的正常模型**,照常发布和转发。
 
 ## 额度(剩余积分)
 
@@ -521,15 +530,34 @@ docker restart cli-proxy-api-plus   # 插件是启动时加载的,必须重启
 `deploy/` 下是一个 webhook 接收端:CI 构建完直接把它签过名的产物清单 POST 到服务器,
 服务器校验签名 → 下载本平台的 `.so` → 备份旧文件 → 覆盖 → 重启 CPA 容器。
 
+两台服务器都装了同一套接收端,区别只在架构、插件目录和监听端口:
+
+| 主机 | 架构 | 插件目录 | 接收端监听 | CI 是否投递 |
+| --- | --- | --- | --- | --- |
+| cn2 | x86_64 | `/root/code/cliproxyapiplus-docker/plugins` | `127.0.0.1:9000` | 否 |
+| arm1 | aarch64 | `/home/ubuntu/code/cliproxyapiplus-docker/plugins` | `127.0.0.1:9001` | 是 |
+
+arm1 上的 9000 被另一个无关的 webhook 服务占着,所以它的接收端放在 9001。
+
+**CI 只投递 arm1。** cn2 的接收端还在跑,但收不到东西,它的插件不再随 push 自动更新;
+要更新 cn2 得把 `DEPLOY_WEBHOOK_URL` 改回 cn2,或者手工把 amd64 产物拷过去重启容器。
+
 ```
 push main / tag
       ↓
 GitHub Actions: 各平台 build, 产物上传到 Release
       ↓
-CI 用 HMAC-SHA256 签名 POST 到 https://<你的域名>/hooks/plugin-deploy
+CI 用 HMAC-SHA256 签名, POST 到 DEPLOY_WEBHOOK_URL
       ↓
-服务器: 校验 X-Hub-Signature-256 → 挑 linux-amd64 的 .so → 备份 → 覆盖 → docker restart
+arm1  https://cliproxy-arm.onlylike.work/hooks/plugin-deploy
+      ↓
+校验 X-Hub-Signature-256 → 挑本平台 PLATFORM 的 .so → 备份 → 覆盖 → docker restart
 ```
+
+这份 payload 里仍然列了全部四个产物(`workbuddy{,-global}-linux-{amd64,arm64}.so`),
+接收端按自己的 `PLATFORM` 只装匹配的那两个,另一个架构的直接忽略。arm1 的 `PLATFORM`
+是 `linux-arm64`,所以它装的是 arm64 那两个。以后要把 cn2 也接回来,只需要在 GitHub
+再加一个 secret、CI 里多投一次,产物清单不用改。
 
 CI 直接推而不用 GitHub 的 `release` 事件,是因为每次 push `main` 都是**更新**同一个
 `rolling` release,GitHub 只会发 `edited` 而不会发 `published`,靠事件就只生效一次。
@@ -537,25 +565,34 @@ CI 直接推而不用 GitHub 的 `release` 事件,是因为每次 push `main` �
 **一次性配置**:
 
 1. 在 GitHub 仓库 Settings → Secrets 加两个变量(我没有写 secrets 的权限,这一步要手动):
-   - `DEPLOY_WEBHOOK_URL` = `https://<你的域名>/hooks/plugin-deploy`
-   - `DEPLOY_WEBHOOK_SECRET` = 服务器上生成的那个 secret
-2. 服务器上跑安装脚本(会生成 secret、装 systemd 单元):
+   - `DEPLOY_WEBHOOK_URL` = `https://cliproxy-arm.onlylike.work/hooks/plugin-deploy`
+   - `DEPLOY_WEBHOOK_SECRET` = 接收端安装时用的那个 secret(与机器上
+     `/opt/plugin-deploy/plugin-deploy.env` 里的 `WEBHOOK_SECRET` 必须是同一个值,
+     否则签名验不过)
+2. 两台服务器上跑安装脚本(会生成 secret、装 systemd 单元):
 
 ```bash
-ssh cn2 'bash -s' < deploy/setup-cn2.sh
+ssh cn2 'bash -s' < deploy/setup-host.sh
+ssh arm1 'PLATFORM=linux-arm64 PLUGIN_DIR=/home/ubuntu/code/cliproxyapiplus-docker/plugins LISTEN_PORT=9001 WEBHOOK_SECRET=<与接收端一致的 secret> bash -s' < deploy/setup-host.sh
 ```
 
-3. 把脚本打印的 Caddy 片段加进 `/etc/caddy/Caddyfile`,然后 `systemctl reload caddy`。
+3. 把脚本打印的 Caddy 片段加进各自机器的 `/etc/caddy/Caddyfile`,然后 `systemctl reload caddy`。
+   两台机器的 site block 都要在兜底的 `reverse_proxy` 之前加上 `handle /hooks/plugin-deploy*`:
+   cn2 转发到 `127.0.0.1:9000`,arm1 转发到 `127.0.0.1:9001`。
 
 **日常运维**:
 
 ```bash
-ssh cn2 journalctl -u plugin-deploy-webhook -f   # 看部署日志
-ssh cn2 python3 /opt/plugin-deploy/deploy-webhook.py status
-ssh cn2 python3 /opt/plugin-deploy/deploy-webhook.py rollback   # 列出可回滚的备份
+ssh arm1 journalctl -u plugin-deploy-webhook -f   # 看部署日志(CI 投递的那台)
+ssh cn2  journalctl -u plugin-deploy-webhook -f   # cn2 接收端仍在跑,只是没人投
+ssh arm1 python3 /opt/plugin-deploy/deploy-webhook.py status
+ssh cn2  python3 /opt/plugin-deploy/deploy-webhook.py status
+ssh arm1 python3 /opt/plugin-deploy/deploy-webhook.py rollback   # 列出可回滚的备份
+ssh cn2  python3 /opt/plugin-deploy/deploy-webhook.py rollback
 ```
 
-配置文件 `/opt/plugin-deploy/plugin-deploy.env`(`chmod 600`,里面有共享密钥)。
+配置文件 `/opt/plugin-deploy/plugin-deploy.env`(`chmod 600`,里面有共享密钥),
+两台机器各一份,`PLATFORM` / `PLUGIN_DIR` / `LISTEN_PORT` 按上面的表填。
 改 `DRY_RUN=1` 可以只看会发生什么、不动线上文件。
 
 ## 使用
