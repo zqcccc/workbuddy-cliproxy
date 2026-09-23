@@ -1,3 +1,15 @@
+# WorkBuddy tab icon patch for the CPA management panel frontend.
+#
+# Repository: https://github.com/router-for-me/Cli-Proxy-API-Management-Center
+# Base commit: 4530da271ba2e89810d4dccebc57f3091afa590a (tag v1.24.2)
+#
+# Apply against that commit. Later upstream commits move these files, so on a
+# newer base use `git apply -3` and resolve, or re-derive the four hunks.
+#
+# Rebuild:  bun install --frozen-lockfile && bun run build
+# Artifact: dist/index.html -> rename to management.html (the host's updater
+#           only accepts an asset named exactly management.html).
+#
 diff --git a/src/assets/icons/workbuddy.svg b/src/assets/icons/workbuddy.svg
 new file mode 100644
 index 0000000..0eb9a6c

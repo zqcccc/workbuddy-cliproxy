@@ -475,15 +475,34 @@ CPA 面板对内置 provider 的图标是**写死的表**(`claude` / `codex` / `
 `entry.Logo = htmlsanitize.String(info.Metadata.Logo)`),裸内联 SVG 的 `<`
 会被改写,base64 的字符集(`A-Za-z0-9+/=`)则原样通过。
 
-**认证文件页的 provider 过滤标签是宿主前端的静态表,插件填不进。** 标签的图标
+**认证文件页的 provider 过滤标签走的是宿主前端的静态表,插件填不进。** 标签的图标
 由 `AUTH_FILE_ICONS` 决定(键是凭据的 `type`,`ProviderTabs.tsx` 用它取
 `<img src>`),表里没有 `workbuddy` 就回落成首字母方块;而且认证文件页不请求
-插件列表接口,插件的 `logo` 也传不到那里。仓库里的 `panel-workbuddy-icon.patch`
-是给宿主前端 `Cli-Proxy-API-Management-Center` 打的补丁,补上这两个键
-(`workbuddy` / `workbuddy-global`)、同款 SVG 资产、标签配色与四种语言的标签
-文案;打上之后认证文件页、额度卡、OAuth 编辑器三处会同时生效,因为三者共用
-这张表。凭据卡片本身(`AuthFileCard`)按设计只渲染文字药丸、不渲染图标,
-补丁不动它。
+插件列表接口,插件的 `logo` 传不到那里。仓库里的 `panel-workbuddy-icon.patch`
+是给宿主前端 `Cli-Proxy-API-Management-Center` 打的补丁(基线 `4530da2`,
+即 v1.24.2),补上这两个键(`workbuddy` / `workbuddy-global`)、同款 SVG 资产、
+标签配色与四种语言的标签文案。打上之后**过滤标签、额度卡、OAuth 编辑器三处**
+同时生效,因为三者共用同一个 `getAuthFileIcon`。凭据卡片(`AuthFileCard`)按
+设计只渲染文字药丸、不渲染图标,上游还有测试断言它的源码不含 `<img>`,补丁
+不动它。
+
+重建与投放:
+
+```bash
+git clone --depth 1 https://github.com/router-for-me/Cli-Proxy-API-Management-Center.git
+cd Cli-Proxy-API-Management-Center
+git apply /path/to/panel-workbuddy-icon.patch
+bun install --frozen-lockfile && bun run build
+# 产物 dist/index.html 改名为 management.html —— 宿主更新器只认这个名字
+```
+
+补丁只是源码,不会自己生效。要让 arm1 用上,得二选一:把
+`remote-management.panel-github-repository` 指向放了 `management.html` 的
+release 仓库,或者挂 `MANAGEMENT_STATIC_PATH` 并把
+`remote-management.disable-auto-update-panel` 设为 `true` —— 只设路径不关
+自动更新的话,宿主每隔 3 小时仍会拿上游 `/releases/latest` 覆盖掉本地文件。
+改 compose 的 environment 或卷挂载后,`docker restart` 不会生效(它用容器创建
+时的旧配置),必须 `docker compose up -d` 重建容器。
 
 ### 为什么卡片上做不了官方那种 CSS 进度条
 
