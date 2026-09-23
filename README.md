@@ -510,8 +510,11 @@ GitHub Actions 会为每次构建产出各平台的 `.so`,发布在两个 tag �
 
 | tag | 时机 | 内容 |
 | --- | --- | --- |
-| `rolling` | 每次 push `main` | 全平台,预发布 |
-| `v*` | 打了 `v` 开头的 tag | 全平台,正式发布 |
+| `rolling` | 每次 push `main` | 全平台,同一个 release 覆盖更新 |
+| `v*` | 打了 `v` 开头的 tag | 全平台,每个 tag 各自留存 |
+
+两个 tag 都发布成普通 release(不是预发布),产物直接出现在仓库 Releases 页面。
+`rolling` 每次构建都会替换掉上一次的产物,只保留最新一次;需要留存历史版本就打 `v*` tag。
 
 命名规则 `workbuddy-<goos>-<goarch>.so` / `workbuddy-global-<goos>-<goarch>.so`,
 例如 Linux x86_64 取 `workbuddy-linux-amd64.so`。装到 CPA 的 `plugins/` 时**要改回**

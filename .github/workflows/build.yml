@@ -71,7 +71,7 @@ jobs:
           retention-days: 30
 
   # Publish a GitHub Release holding every platform's artifacts, then tell the
-  # server to update itself. main -> rolling pre-release; v* tag -> that tag.
+  # server to update itself. main -> rolling release; v* tag -> that tag.
   publish:
     name: publish
     needs: build
@@ -111,7 +111,12 @@ jobs:
             PLATFORM (linux-amd64 on x86_64, linux-arm64 on aarch64) as
             plugins/workbuddy.so and plugins/workbuddy-global.so; the other
             pair in the payload is ignored.
-          prerelease: ${{ github.ref == 'refs/heads/main' }}
+          # Every build lands in a normal (non-prerelease) release, so the repo's
+          # Releases page and the `latest` pointer both show the artifacts.
+          prerelease: false
+          # main 每次 push 都覆盖同一个 rolling tag;若把它设为 latest,下次 push 会抢占
+          # 未来 v* tag 的 latest 标记,所以 rolling 不抢 latest,只有 v* tag 才成为 latest。
+          make_latest: ${{ github.ref == 'refs/heads/main' && 'false' || 'true' }}
           files: |
             dist/*.so
             dist/SHA256SUMS.txt
