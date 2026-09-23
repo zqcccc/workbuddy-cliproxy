@@ -21,3 +21,6 @@ workbuddy-cliproxy
 
 # CI 构建产物目录(build.sh --outdir)
 dist/
+
+# 本地临时工作目录(配置副本、下载产物等)
+.work/

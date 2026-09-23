@@ -122,6 +122,9 @@ jobs:
       # release event: editing an existing release (every main push re-uploads
       # to `rolling`) fires `edited`, not `published`, so event-driven delivery
       # would silently stop after the first deploy.
+      #
+      # The payload lists every platform's asset; the receiver keeps only the ones
+      # matching its own PLATFORM and ignores the rest.
       - name: Notify deploy webhook
         env:
           WEBHOOK_URL: ${{ secrets.DEPLOY_WEBHOOK_URL }}
@@ -136,8 +139,8 @@ jobs:
           base="https://github.com/${{ github.repository }}/releases/download/${TAG}"
           # Built with printf on one line: the HMAC covers these exact bytes, so
           # the payload must not pick up a heredoc's indentation.
-          payload=$(printf '{"tag":"%s","sha":"%s","assets":[{"name":"workbuddy-linux-amd64.so","url":"%s/workbuddy-linux-amd64.so"},{"name":"workbuddy-global-linux-amd64.so","url":"%s/workbuddy-global-linux-amd64.so"}]}' \
-            "${TAG}" "${{ github.sha }}" "${base}" "${base}")
+          payload=$(printf '{"tag":"%s","sha":"%s","assets":[{"name":"workbuddy-linux-amd64.so","url":"%s/workbuddy-linux-amd64.so"},{"name":"workbuddy-global-linux-amd64.so","url":"%s/workbuddy-global-linux-amd64.so"},{"name":"workbuddy-linux-arm64.so","url":"%s/workbuddy-linux-arm64.so"},{"name":"workbuddy-global-linux-arm64.so","url":"%s/workbuddy-global-linux-arm64.so"}]}' \
+            "${TAG}" "${{ github.sha }}" "${base}" "${base}" "${base}" "${base}")
           sig=$(printf '%s' "$payload" \
             | openssl dgst -sha256 -hmac "${WEBHOOK_SECRET}" -hex \
             | sed 's/^.* //')

@@ -1,15 +1,29 @@
 #!/usr/bin/env bash
-# Install the plugin deploy webhook on cn2. Run as root.
+# Install the plugin deploy webhook on a CPA host. Run as root.
 #
-#   ssh cn2 'bash -s' < deploy/setup-cn2.sh
+#   ssh cn2 'bash -s' < deploy/setup-host.sh
+#   ssh arm1 'bash -s' < deploy/setup-host.sh
+#
+# Host-specific values come from the environment; the defaults match cn2
+# (amd64, CPA under /root). arm1 needs:
+#
+#   PLATFORM=linux-arm64
+#   PLUGIN_DIR=/home/ubuntu/code/cliproxyapiplus-docker/plugins
+#   LISTEN_PORT=9001          # arm1 already runs adnanh/webhook on 9000
 #
 # Idempotent: safe to re-run. It never overwrites an existing env file, so the
 # WEBHOOK_SECRET you set the first time survives re-runs.
 set -euo pipefail
 
-INSTALL_DIR=/opt/plugin-deploy
+INSTALL_DIR="${INSTALL_DIR:-/opt/plugin-deploy}"
 ENV_FILE="$INSTALL_DIR/plugin-deploy.env"
 REPO_DIR="${REPO_DIR:-$PWD}"
+
+# Overrides applied when the env file is created for the first time.
+PLATFORM="${PLATFORM:-linux-amd64}"
+PLUGIN_DIR="${PLUGIN_DIR:-/root/code/cliproxyapiplus-docker/plugins}"
+CONTAINER_NAME="${CONTAINER_NAME:-cli-proxy-api-plus}"
+LISTEN_PORT="${LISTEN_PORT:-9000}"
 
 # Accept either a repo checkout (deploy/<file>) or a flat directory of the
 # already-extracted deploy files (scp'd straight into /opt/plugin-deploy).
@@ -36,9 +50,23 @@ if [ ! -f "$ENV_FILE" ]; then
   echo "==> creating $ENV_FILE"
   if [ -f "$SRC_DIR/plugin-deploy.env.example" ]; then
     install -m 0600 "$SRC_DIR/plugin-deploy.env.example" "$ENV_FILE"
+    sed -i.bak \
+      -e "s|^PLATFORM=.*|PLATFORM=$PLATFORM|" \
+      -e "s|^PLUGIN_DIR=.*|PLUGIN_DIR=$PLUGIN_DIR|" \
+      -e "s|^CONTAINER_NAME=.*|CONTAINER_NAME=$CONTAINER_NAME|" \
+      -e "s|^LISTEN_PORT=.*|LISTEN_PORT=$LISTEN_PORT|" \
+      "$ENV_FILE"
+    rm -f "$ENV_FILE.bak"
     # Generate a secret so the listener refuses to start without one, and so
     # there is a concrete value to paste into the GitHub webhook / CI secret.
-    secret=$(python3 -c 'import secrets;print(secrets.token_hex(32))')
+    # Every host that receives the same CI delivery must share one value: pass
+    # WEBHOOK_SECRET in the environment (see README) instead of letting each
+    # host invent its own.
+    if [ -n "${WEBHOOK_SECRET:-}" ]; then
+      secret="$WEBHOOK_SECRET"
+    else
+      secret=$(python3 -c 'import secrets;print(secrets.token_hex(32))')
+    fi
     sed -i.bak "s|^WEBHOOK_SECRET=.*|WEBHOOK_SECRET=$secret|" "$ENV_FILE"
     rm -f "$ENV_FILE.bak"
     echo "    generated WEBHOOK_SECRET"
@@ -74,13 +102,14 @@ echo "-------------------------------------------------------------------"
 echo "Webhook secret (put this in the GitHub repo secret DEPLOY_WEBHOOK_SECRET):"
 grep -E '^WEBHOOK_SECRET=' "$ENV_FILE" | cut -d= -f2-
 echo
-echo "Public URL: https://cliproxy.onlylike.work/hooks/plugin-deploy"
+echo "Platform: $(grep -E '^PLATFORM=' "$ENV_FILE" | cut -d= -f2-)"
+echo "Public URL: https://<this host's domain>/hooks/plugin-deploy"
 echo "(add the Caddy snippet below to /etc/caddy/Caddyfile, then: systemctl reload caddy)"
 echo "-------------------------------------------------------------------"
-cat <<'SNIPPET'
+cat <<SNIPPET
 
 handle /hooks/plugin-deploy* {
-    reverse_proxy 127.0.0.1:9000
+    reverse_proxy 127.0.0.1:$(grep -E '^LISTEN_PORT=' "$ENV_FILE" | cut -d= -f2)
 }
 
 SNIPPET
