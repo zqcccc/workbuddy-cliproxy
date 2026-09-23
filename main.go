@@ -495,6 +495,9 @@ func wbRegistration() registration {
 			Version:          "0.1.0",
 			Author:           "zqcccc (clean-room rebuild; original workbuddy by Sliverkiss)",
 			GitHubRepository: "https://github.com/zqcccc/workbuddy-cliproxy",
+			// The management panel has no built-in WorkBuddy icon and falls
+			// back to a generic plug glyph without this. See logo.go.
+			Logo: logoDataURL,
 		},
 		Capabilities: registrationCapability{
 			ModelProvider:         true,

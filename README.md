@@ -455,6 +455,33 @@ label 同步写一份到 `Attributes["email"]`,AuthData.Label 和 Attributes["em
 **插件不会用 `host.auth.save` 回写**:那是整文件覆盖,和宿主自己的 refresh 抢写,
 一旦覆盖到旧 token 就把凭据弄废了。
 
+
+### 面板上的 WorkBuddy 图标
+
+CPA 面板对内置 provider 的图标是**写死的表**(`claude` / `codex` / `gemini` /
+`kimi` / `qwen` / `xai` / `vertex` / `meta` / `devin` / `iflow` / `aistudio`),
+表里没有的 provider 一律回落成一个通用插头图形。插件唯一能自己控制的通道是
+注册响应里的 `metadata.Logo`,面板会在**三处**读它:
+
+- OAuth 页的 provider 卡片(`OAuthPage.tsx` 的 `buildPluginOAuthProviderCards`,
+  取 `plugin.logo || plugin.metadata?.logo`)
+- 插件管理页的插件卡
+- 左侧边栏的插件条目
+
+`logo.go` 把官方 WorkBuddy 徽标(40×40 圆角方形,青绿渐变 + 白色 W)以
+**base64 data URL** 内联进去,原因有两条:面板跑在操作者浏览器里,不一定能访问
+服务器能访问的域名,data URL 一定能解析;而且宿主会把 `metadata.Logo` 过一遍
+`html.EscapeString`(见 `internal/api/handlers/management/plugins.go` 的
+`entry.Logo = htmlsanitize.String(info.Metadata.Logo)`),裸内联 SVG 的 `<`
+会被改写,base64 的字符集(`A-Za-z0-9+/=`)则原样通过。
+
+**认证文件列表的凭据卡片加不上图标。** 这不是没找到字段,而是宿主前端根本没有
+这条通路:凭据卡片(`AuthFileCard`)按设计只渲染一个文字药丸,不渲染任何图标;
+认证文件页顶部那条 provider 过滤标签的图标走的是**另一张写死的表**
+(`AUTH_FILE_ICONS`),查表键是凭据的 `type`,同样没有 `workbuddy`;而且
+认证文件页不请求插件列表接口,插件的 `logo` 传不到那里。想让 workbuddy 在
+认证文件页显示图标,只能给宿主前端提 PR 加表项。
+
 ### 为什么卡片上做不了官方那种 CSS 进度条
 
 Antigravity / Claude / Codex 卡片里那些「套餐 Pro → Five Hour Limit Remaining」
