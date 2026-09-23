@@ -475,12 +475,15 @@ CPA 面板对内置 provider 的图标是**写死的表**(`claude` / `codex` / `
 `entry.Logo = htmlsanitize.String(info.Metadata.Logo)`),裸内联 SVG 的 `<`
 会被改写,base64 的字符集(`A-Za-z0-9+/=`)则原样通过。
 
-**认证文件列表的凭据卡片加不上图标。** 这不是没找到字段,而是宿主前端根本没有
-这条通路:凭据卡片(`AuthFileCard`)按设计只渲染一个文字药丸,不渲染任何图标;
-认证文件页顶部那条 provider 过滤标签的图标走的是**另一张写死的表**
-(`AUTH_FILE_ICONS`),查表键是凭据的 `type`,同样没有 `workbuddy`;而且
-认证文件页不请求插件列表接口,插件的 `logo` 传不到那里。想让 workbuddy 在
-认证文件页显示图标,只能给宿主前端提 PR 加表项。
+**认证文件页的 provider 过滤标签是宿主前端的静态表,插件填不进。** 标签的图标
+由 `AUTH_FILE_ICONS` 决定(键是凭据的 `type`,`ProviderTabs.tsx` 用它取
+`<img src>`),表里没有 `workbuddy` 就回落成首字母方块;而且认证文件页不请求
+插件列表接口,插件的 `logo` 也传不到那里。仓库里的 `panel-workbuddy-icon.patch`
+是给宿主前端 `Cli-Proxy-API-Management-Center` 打的补丁,补上这两个键
+(`workbuddy` / `workbuddy-global`)、同款 SVG 资产、标签配色与四种语言的标签
+文案;打上之后认证文件页、额度卡、OAuth 编辑器三处会同时生效,因为三者共用
+这张表。凭据卡片本身(`AuthFileCard`)按设计只渲染文字药丸、不渲染图标,
+补丁不动它。
 
 ### 为什么卡片上做不了官方那种 CSS 进度条
 
