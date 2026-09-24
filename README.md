@@ -104,10 +104,13 @@ plugins:
    `data.models` 就是该账号有权使用的模型目录(带 `maxInputTokens` / `maxOutputTokens` /
    `supportsImages` 等 serving 字段)。
 2. `GET /console/enterprises/personal/models` —— 控制台目录。**两个接口都拉,然后合并**,因为
-   各自都列了对方没有的模型:`/v3/config` 有 `hy4-preview-f` 但没有 `hy4-preview-x`,
-   控制台有 `hy4-preview-x` / `auto` 且是唯一带 `contextWindow` 可选预算的那个。
+   各自都列了对方没有的模型(国内:`/v3/config` 按账号含 `hy4-preview-f` 或
+   `hy4-preview-x` 其中之一,控制台是唯一带 `contextWindow` 可选预算的那个)。
    谁都不是对方超集,只读一个会静默丢掉账号其实能用的模型。
-3. 都失败(网络不通 / token 失效 / 上游改结构)时**不发任何模型**:返回空列表,
+3. 同一响应里的**试用横幅**(`productFeaturesConfig.ModelTrialBanner`,如全区统一的
+   `hy4-preview-f`)自动补进目录,上限取**对面区的同名实时条目**(同一 token 打对面
+   域名免费可读)—— 上游增删试用 id,下个刷新周期自动跟上,零配置。
+4. 都失败(网络不通 / token 失效 / 上游改结构)时**不发任何模型**:返回空列表,
    等待下一次发现恢复。旧版本硬编码了一份"通用"兜底目录,但里面每一项要么在
    至少一个区按积分计费(glm-5v-turbo x0.71、kimi-k2.5 x0.45、gpt-5.5 x3.31、
    gemini-3.5-flash x0.99),要么两区目录都已不存在(deepseek-v3.2),上游对未知
@@ -119,17 +122,20 @@ plugins:
 
 - 带 Bearer(插件运行时的认证方式) → 固定 **500**,换 UA / 换 header 组合都无效。
 - 带浏览器 cookie(`session` + `session_2` 两个成对,缺一不可;UA 还得是
-  `Chrome/152` 那一档) → **200**,实测 29648 字节、18 个模型。
+  `Chrome/152` 那一档) → **200**。
 - 国内版(`copilot.tencent.com`)宽容得多:**带 Bearer 直接 200**,无需 cookie。
 
 插件 OAuth 登录走的是 `/v2/plugin/auth/state`(实测**不下发** session cookie,登录由用户在
-浏览器完成),所以运行时手里只有 Bearer —— 国际版这条控制台接口因此拿不到。想让国际版也吃到
-控制台数据,得把浏览器的 `session` / `session_2` 喂进来(会过期,需手动续),或者等上游把 hy4
-加进 `/v3/config`。在此之前国际版 hy4 只能靠 `extra_models` 显式声明,见下节。
+浏览器完成),所以运行时手里只有 Bearer —— 国际版这条控制台接口因此拿不到。
+但自 2026-09-24 起国际版 `/v3/config` 自身已列出 `hy4-preview`(22 个模型),
+缺的只剩试用变体 `-f` / `-x`:其中 `-f` 由同一响应里的试用横幅
+(`productFeaturesConfig.ModelTrialBanner`)实时补上,见下节;仅 `-x` 仍需
+`extra_models` 显式声明。
 
 结果按账号缓存 30 分钟。发现失败会走 `host.log` 打一条 `warn`,在 CPA 日志里能看到原因。
 
-已用真实账号验证:带 Bearer 时 `/v3/config` 确实返回 `data.models`(实测每账号 29 个),字段同
+已用真实账号验证:带 Bearer 时 `/v3/config` 确实返回 `data.models`(2026-09-24 实测
+国内每账号 31 个、国际 22 个),字段同
 `{id, name, vendor, descriptionZh/En, maxInputTokens, maxOutputTokens, supportsImages,
 supportsToolCall, supportsReasoning, onlyReasoning, credits, ...}`。
 
@@ -162,15 +168,27 @@ suggestion、提示词增强,不能走 chat completions)。
 只有一个可选值(等于没有预算)时退回 `maxInputTokens`,并且**永远不会超过 `maxInputTokens`**。
 没有 `contextWindow` 的模型行为不变。
 
-### 上游目录不全时:`extra_models`
+### 上游目录不全时:试用横幅自动补全 + `extra_models`
 
-`/v3/config` 并不总是完整。**国际版实测会漏掉整个 hy4 系列** —— 拿 OAuth token 直接调
-`https://www.workbuddy.ai/v2/chat/completions`,`hy4-preview` / `hy4-preview-f` /
-`hy4-preview-x` 全都返回 200(能用),但 `/v3/config` 里只有 `hy3`。而控制台那个
-`/console/enterprises/personal/models` 确实列了它们,**但它只认浏览器 session cookie**,
-带 Bearer 打过去在国际版是 500(国内版这个接口带 Bearer 是能通的),插件拿不到 cookie。
+`/v3/config` 并不总是完整。**国际版目录会漏掉试用变体** —— `hy4-preview-f` /
+`hy4-preview-x` 拿 OAuth token 直接调
+`https://www.workbuddy.ai/v2/chat/completions` 都返回 200(能用),但 `/v3/config`
+的 `data.models` 里只有 `hy4-preview`(自 2026-09-24 起,共 22 个模型)。
+而控制台那个 `/console/enterprises/personal/models` 确实列了它们,**但它只认
+浏览器 session cookie**,带 Bearer 打过去在国际版是 500(国内版这个接口带
+Bearer 是能通的),插件拿不到 cookie。
 
-所以补一个显式配置项,避免把 id 硬编码进二进制:
+所以插件每次拉目录时做两层实时补全,都不用改配置:
+
+1. **试用横幅**:同一 `/v3/config` 响应里的
+   `productFeaturesConfig.ModelTrialBanner.banners[]` 点名了 `hy4-preview-f`
+   (两区都有),插件把它自动发布,上限取**另一区的同名条目**(同一个 token
+   打对面域名也通,免费)—— 拿不到才退回内置实测值。上游哪天增删试用
+   id,下个 30 分钟刷新周期自动跟上。
+2. **跨区元数据**:`extra_models` 里裸 id 缺的字段,同样先用对面区的实时条目
+   补,再退回内置实测值。
+
+仍需显式配置的只剩横幅和目录**都没点名**的 id(目前仅 `hy4-preview-x`):
 
 ```yaml
     workbuddy-global:
@@ -178,14 +196,18 @@ suggestion、提示词增强,不能走 chat completions)。
       priority: 100
       region: global
       extra_models:
-        - hy4-preview
-        - hy4-preview-f
         - hy4-preview-x
 ```
 
-国际版目录同样会漏掉 deepseek 系列(`deepseek-v4.1-flash` 能调通但不在 `/v3/config` 里)。
-这类"目录里查不到"的 id 建议用对象写法把上限写死,否则会落到 200000/8192 的兜底值
-(见下节),cn2 上就是这么配的:
+横幅补全的 id **不受 `publish_mode: allow` 限制**(它是本区自己的试用入口,
+不可能是别家 provider 的模型),所以 allow 列表不用为它加条目;`extra_models`
+同理,一直如此。
+
+这类"目录里查不到、横幅也没点名"的 id 才建议用对象写法把上限写死,
+否则会落到 200000/8192 的兜底值(见下节)。注意先确认它真的不在目录里:
+`deepseek-v4.1-flash` 自 2026-09-24 起已在国际版 `/v3/config` 中
+(x0.00,自带 300000/1000000 可选预算),**不再需要**下面这种手写配置
+(留着也无害:已在目录里的 id 不会重复添加):
 
 ```yaml
       extra_models:
@@ -222,16 +244,18 @@ hy4-preview-x   ctx=1000000  out=64000   (接口值,经 extra_models 补进目�
 hy3             ctx=192000   out=64000
 ```
 
-国际(浏览器 cookie,200,18 个模型):
+国际(`/v3/config` 带 Bearer,200,22 个模型,2026-09-24):
 
 ```
 hy4-preview   in=1000000  out=64000
               contextWindow: {defaultLength: 200000, supportedLengths: [200000, 1000000]}
+hy4-preview-f in=1000000  out=64000   (试用横幅补全,上限取自对面区实时条目 x0.00)
 hy3           in=192000   out=64000
 ```
 
-注意国际版控制台目录**只列了 `hy4-preview`**,`-f` / `-x` 没有 —— 这两个的真实上限目前
-**没有任何接口能证实**,只能按 `hy4-preview` 推断,推断值请显式写进配置而不要当实测。
+注意国际版目录和横幅**都没有 `hy4-preview-x`** —— 它的真实上限目前只有
+国内版目录能证实(1M/64k,x0.29),由跨区元数据实时同步,仍建议在 `extra_models`
+里留一行裸 id;它一旦出现在国际版目录或横幅里,该行会自动退化成空操作。
 
 对比改动前:hy4 全部报 `ctx=200000 / out=8192` —— 8192 是插件的兜底常量,不是上游限制。
 
@@ -242,9 +266,9 @@ hy3           in=192000   out=64000
 
 ```yaml
       extra_models:
-        - hy4-preview-f                 # 裸 id:跟随接口
-        - id: hy4-preview-x             # 对象:只覆盖写出来的字段,其余仍跟随接口
-          name: Hy4 preview
+        - hy4-preview-x               # 裸 id:跟随接口(目录/横幅/对面区实时值)
+        - id: some-model              # 对象:只覆盖写出来的字段,其余仍跟随接口
+          name: Some model
           maxOutputTokens: 32000        # 刻意压低
           contextWindow:
             defaultLength: 1000000
@@ -256,9 +280,11 @@ hy3           in=192000   out=64000
 (因为接口给的 `defaultLength` 就是 200000)。**往上调之前先确认上游收得下**,否则客户端按 1M
 装 prompt 会被拒。
 
-顺带一个观察到的现象:**同一个 OAuth token 打国内域名 `copilot.tencent.com/v3/config` 也能
-通**,而且返回 29 个模型、含 hy4 —— 但这个列表是按国内目录给的,里面有些 id(比如
-`hy3-x`)在国际版上调不通(`11102 service info not found`),所以不能直接拿来当国际版目录用。
+顺带一个用到的特性:**同一个 OAuth token 打对面域名 `.../v3/config` 也能
+通**(国际 token 打国内返回 31 个模型,含 `hy4-preview-f` x0.00)。但这个列表是按
+对面目录给的,里面有些 id(比如 `hy3-x`)在本区调不通
+(`11102 service info not found`),所以它只被用作**元数据源**(给横幅 id 和
+`extra_models` 补上限),从不直接当本区目录用。
 
 ### 给某个区的模型加命名空间:`model_prefix`
 
@@ -301,12 +327,27 @@ force-model-prefix: true
 加了前缀后还会顺带解放一些被别的 provider 占着的 id:`gpt-5.6-luna` / `gpt-5.6-terra`
 原本归 openai provider,现在能以 `global/gpt-5.6-luna` 走国际版。
 
-> ⚠️ **前缀是"加一份",不是"改名字"**,裸 id 依然会注册。而且
-> `force-model-prefix: false`(默认)时宿主**会把裸 id 也匹配到 `<prefix>/<id>` 上**,
-> 于是插件一旦发布 `global/gpt-5.6-luna`,裸 `gpt-5.6-luna` 的流量也会落到本插件 ——
-> 再叠加插件 priority(100/200)高于内置 provider(默认 0),本插件反而排到 openai **前面**。
-> 若国际版账号对该 id 没有权限,上游会挂起几十秒后返回空流,请求照发照计费。
-> 要避免这种"抢注",见下一节。
+> ⚠️ **配了 `model_prefix` 的实例,裸 id 永不发布** —— 这是插件侧的硬规则,
+> 不依赖宿主配置。原理:宿主是否同时发布裸 id 由它自己的 `force-model-prefix`
+> 开关决定,而插件在每次 `model.for_auth` 时都能读到这个开关的实时值
+> (`req.Host.ForceModelPrefix`)。开关开着时插件放心发布全目录(出去的都是
+> `global/*`,裸名不存在);开关关着时,插件**自动扣下整个主目录**(效果等同
+> `publish_mode: allow` 且白名单为空),只发横幅补全 + `extra_models`,并在
+> CPA 日志里打一条 warn 告诉你把开关打开。想让国际版模型**只有**
+> `global/` 一种叫法,就必须在 CPA 全局开:
+>
+> ```yaml
+> force-model-prefix: true
+> ```
+>
+> 看起来是"全局"开关,其实**只对配了 `model_prefix` 的 provider 生效**,可以放心开:
+> `applyModelPrefixes` 第一行就是 `if trimmedPrefix == "" { return models }`,内置 provider
+> (codex / antigravity / gemini…)和没配前缀的插件根本没有 prefix,直接原样返回,不受影响。
+> (早期 README 说"会影响所有 provider"是错的,已订正。)
+>
+> 所以 `gpt-5.6-sol` 这类别家也有的 id,在国际版插件这里**只存在 `global/gpt-5.6-sol`
+> 一种写法**:开关开着,全目录发布但全带前缀;开关关着,它根本不出目录。
+> 不存在"裸 `gpt-5.6-sol` 走到国际版凭据上"的中间态。
 
 ### 只发布指定的模型:`publish_mode` / `publish_allow`
 
@@ -318,17 +359,16 @@ force-model-prefix: true
     workbuddy-global:
       region: global
       model_prefix: global
-      publish_mode: allow      # 只发 extra_models + publish_allow
+      publish_mode: allow      # 只发横幅补全 + extra_models + publish_allow
       publish_allow:
         - hy3                  # 目录里确实属于本区、且账号能用的 id
       extra_models:
-        - hy4-preview-f
-        - id: deepseek-v4.1-flash
-          maxInputTokens: 1000000
-          maxOutputTokens: 128000
+        - hy4-preview-x        # 横幅和目录都没点名、但确实能用的 id
 ```
 
-- `publish_mode: catalog`(默认)发全目录;`allow` 只发 `extra_models` + `publish_allow`。
+- `publish_mode: catalog`(默认)发全目录;`allow` 只发横幅补全 + `extra_models` +
+  `publish_allow`。注意 `catalog` 对配了 `model_prefix` 的实例有个前提:宿主必须开着
+  `force-model-prefix`,否则插件自动按 `allow`(空白名单)处理,见上一节 —— 裸 id 永不发布。
 - `publish_allow` 只是"从目录里挑",不会凭空造 id;目录里没有的写了也不出现。
 - 目录拉取失败时**一律不发任何模型**(与 `publish_mode` 无关):插件暂时不报模型,
   等目录恢复。旧版本会回落一份内置兜底列表,那份列表里的 id 要么计费、要么两区

@@ -141,11 +141,15 @@ type pluginConfig struct {
 	// remembers its own realm inside its credential file.
 	Region string `yaml:"region"`
 	// ExtraModels lists model ids this realm serves but does not advertise in
-	// its own catalog. The Global realm's /v3/config omits the hy4 family even
-	// though chat completions accept it, and the endpoint that does list them
+	// its own catalog. Global /v3/config still omits hy4-preview-x (it does
+	// list hy4-preview since 2026-09-24), and the endpoint that does list it
 	// (/console/enterprises/personal/models) only authenticates with a browser
-	// session cookie, which a plugin does not have. Listing them here is the
-	// only way to expose them without hardcoding ids in the binary.
+	// session cookie, which a plugin does not have. The free-trial banner id
+	// hy4-preview-f no longer needs to be listed here: it is picked up
+	// automatically from the trial banner inside /v3/config (see
+	// extractSupplementIDs), with live limits from the cross-realm catalog.
+	// Listing an id here is the only way to expose what neither the catalog
+	// nor the banner names, without hardcoding ids in the binary.
 	//
 	// An entry is either a bare id string, which takes the default context and
 	// output length, or a mapping carrying the catalog fields, so a model the
@@ -704,7 +708,15 @@ func commonHeaders(req *http.Request, region string) {
 // backendHeaders applies auth-derived headers to a chat completion request.
 // Empty fields are signalled via the X-No-* convention used by CodeBuddy.
 func backendHeaders(req *http.Request, sa *storedAuth) {
-	commonHeaders(req, sa.Region)
+	backendHeadersFor(req, sa, sa.Region)
+}
+
+// backendHeadersFor is backendHeaders against an explicit realm. The credentials
+// stay the same, only the Origin/Referer follow the host being called: a
+// cross-realm catalog fetch (Global token against copilot.tencent.com) must
+// present that realm's origin, not the credential's home realm.
+func backendHeadersFor(req *http.Request, sa *storedAuth, region string) {
+	commonHeaders(req, region)
 	if sa.Auth.AccessToken != "" {
 		req.Header.Set("Authorization", "Bearer "+sa.Auth.AccessToken)
 	} else {

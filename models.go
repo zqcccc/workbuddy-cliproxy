@@ -197,50 +197,86 @@ type v3ConfigData struct {
 // Discovery
 // -----------------------------------------------------------------------------
 
-// fetchRemoteModels asks CodeBuddy which models the account may use. Both
-// catalogs are fetched and merged, because each one lists models the other
+// fetchRemoteModels asks CodeBuddy which models the account may use. It returns
+// two lists: the primary catalog (both endpoints merged) and the supplement
+// entries derived from the same payloads (trial banners and similar product
+// references, see extractSupplementIDs). The two stay separate so the publish
+// policy can filter the primary catalog without dropping the supplements,
+// which are always this realm's own trial entries.
+//
+// Both catalogs are fetched and merged, because each one lists models the other
 // omits: /v3/config has hy4-preview-f but not hy4-preview-x, while the console
 // catalog has hy4-preview-x, auto and the selectable contextWindow block but
 // not hy4-preview-f. Neither is a superset, so a single source silently drops
 // models the account can serve.
-func fetchRemoteModels(sa *storedAuth) ([]upstreamModel, error) {
+func fetchRemoteModels(sa *storedAuth) (primary []upstreamModel, supplements []upstreamModel, err error) {
 	headers := func(r *http.Request) { backendHeaders(r, sa) }
 	base := baseFor(sa.Region)
 	client := discoveryHTTPClient()
 
-	v3, v3Err := fetchCatalog(client, http.MethodGet, base+pathConfigV3, headers)
-	console, consoleErr := fetchCatalog(client, http.MethodGet, base+pathConsoleModels, headers)
+	v3, v3Raw, v3Err := fetchCatalogRaw(client, http.MethodGet, base+pathConfigV3, headers)
+	console, consoleRaw, consoleErr := fetchCatalogRaw(client, http.MethodGet, base+pathConsoleModels, headers)
 
-	if len(v3) == 0 && len(console) == 0 {
+	primary = mergeCatalogs(console, v3)
+
+	// Cross-realm metadata is best-effort: the same Bearer credential is
+	// accepted by the other realm's /v3/config and returns that realm's view,
+	// which is what carries limits for ids this realm's catalog omits
+	// (verified 2026-09-24: a Global token against copilot.tencent.com gets 31
+	// models including hy4-preview-f x0.00). It only ever supplies metadata
+	// for supplement and extra_models ids, never new publishable ids on its
+	// own, so a CN-only id such as hy3-x can never leak into the Global list.
+	cross, crossRaw := fetchCrossRealmCatalog(client, sa)
+
+	suppIDs, targets := extractSupplementIDs(v3Raw, consoleRaw, crossRaw)
+	supplements = buildSupplements(suppIDs, targets, primary, cross)
+
+	if len(primary) == 0 && len(supplements) == 0 {
 		// Nothing usable at all. Report why, so the log says what to fix.
 		if v3Err != nil && consoleErr != nil {
-			return nil, fmt.Errorf("v3/config: %w; console/models: %w", v3Err, consoleErr)
+			return nil, nil, fmt.Errorf("v3/config: %w; console/models: %w", v3Err, consoleErr)
 		}
 		if v3Err != nil {
-			return nil, fmt.Errorf("v3/config: %w; console/models: empty model list", v3Err)
+			return nil, nil, fmt.Errorf("v3/config: %w; console/models: empty model list", v3Err)
 		}
 		if consoleErr != nil {
-			return nil, fmt.Errorf("v3/config: empty model list; console/models: %w", consoleErr)
+			return nil, nil, fmt.Errorf("v3/config: empty model list; console/models: %w", consoleErr)
 		}
-		return nil, fmt.Errorf("v3/config and console/models both returned an empty model list")
+		return nil, nil, fmt.Errorf("v3/config and console/models both returned an empty model list")
 	}
 
-	return mergeCatalogs(console, v3), nil
+	return primary, supplements, nil
 }
 
-// fetchCatalog fetches one catalog endpoint and extracts its model list. A
-// failure is returned alongside a nil list so the caller can merge whatever
-// the other endpoint produced.
-func fetchCatalog(client *http.Client, method, url string, headers func(*http.Request)) ([]upstreamModel, error) {
+// fetchCatalogRaw is the single catalog fetch primitive: it extracts the model
+// list and retains the raw payload, so the same response can also supply
+// supplement ids (trial banners and the like). The raw payload is returned
+// even when the model list is empty: a banner-only response still names a
+// servable id.
+func fetchCatalogRaw(client *http.Client, method, url string, headers func(*http.Request)) ([]upstreamModel, json.RawMessage, error) {
 	data, _, err := doJSON(client, method, url, headers, nil)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	models := extractModels(data)
 	if len(models) == 0 {
-		return nil, fmt.Errorf("empty model list")
+		return nil, data, fmt.Errorf("empty model list")
 	}
-	return models, nil
+	return models, data, nil
+}
+
+// fetchCrossRealmCatalog reads the other realm's /v3/config with this same
+// credential and returns its model list plus the raw payload. It is a metadata
+// source only (see fetchRemoteModels) and it never fails discovery: any error
+// yields nil, and the caller falls back to the measured table and defaults.
+func fetchCrossRealmCatalog(client *http.Client, sa *storedAuth) ([]upstreamModel, json.RawMessage) {
+	other := otherRegion(sa.Region)
+	headers := func(r *http.Request) { backendHeadersFor(r, sa, other) }
+	data, _, err := doJSON(client, http.MethodGet, baseFor(other)+pathConfigV3, headers, nil)
+	if err != nil {
+		return nil, nil
+	}
+	return extractModels(data), data
 }
 
 // mergeCatalogs combines two catalogs, preferring the richer entry when both
@@ -314,6 +350,247 @@ var (
 	discoveryClientOnce sync.Once
 	discoveryClient     *http.Client
 )
+
+// -----------------------------------------------------------------------------
+// Supplements: ids the product config references but data.models omits
+// -----------------------------------------------------------------------------
+
+// extractSupplementIDs pulls extra servable ids out of catalog payloads: the
+// free-trial banner (productFeaturesConfig.ModelTrialBanner.banners[].modelId,
+// e.g. hy4-preview-f on both realms), plus any modelPromotions / modelTiers
+// modelIds lists. These sections ship inside the same free /v3/config response
+// as data.models, so they are per-realm, per-fetch and real-time: when upstream
+// adds or retires a trial variant, the next 30-minute refresh follows without
+// a config change.
+//
+// The second result maps a banner modelId to its targetModelId, so metadata
+// can be derived from the target when no catalog describes the id at all.
+//
+// Each payload is the inner data object doJSON returns ({models, ...}), but a
+// {"data": {...}} envelope is accepted too, so callers can pass either shape.
+// A model's relatedModels list is deliberately ignored: those are UI variants
+// (lite, builtin-lite, reasoning), not servable chat ids.
+func extractSupplementIDs(raws ...json.RawMessage) (ids []string, targets map[string]string) {
+	targets = map[string]string{}
+	seen := map[string]struct{}{}
+	add := func(id, target string) {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			return
+		}
+		if _, dup := seen[id]; dup {
+			if target = strings.TrimSpace(target); target != "" {
+				targets[id] = target
+			}
+			return
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+		if target = strings.TrimSpace(target); target != "" {
+			targets[id] = target
+		}
+	}
+	for _, raw := range raws {
+		if len(raw) == 0 {
+			continue
+		}
+		var obj map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &obj); err != nil {
+			continue
+		}
+		// Accept both the inner data object and the full envelope.
+		candidates := []map[string]json.RawMessage{obj}
+		if nested, ok := obj["data"]; ok {
+			var inner map[string]json.RawMessage
+			if json.Unmarshal(nested, &inner) == nil {
+				candidates = append(candidates, inner)
+			}
+		}
+		for _, cand := range candidates {
+			if pfcRaw, ok := cand["productFeaturesConfig"]; ok {
+				var pfc struct {
+					ModelTrialBanner struct {
+						Banners []struct {
+							ModelID       string `json:"modelId"`
+							TargetModelID string `json:"targetModelId"`
+						} `json:"banners"`
+					} `json:"ModelTrialBanner"`
+				}
+				if json.Unmarshal(pfcRaw, &pfc) == nil {
+					for _, b := range pfc.ModelTrialBanner.Banners {
+						add(b.ModelID, b.TargetModelID)
+					}
+				}
+			}
+			for _, key := range []string{"modelPromotions", "modelTiers"} {
+				groupRaw, ok := cand[key]
+				if !ok {
+					continue
+				}
+				var groups []struct {
+					ModelIDs []string `json:"modelIds"`
+				}
+				if json.Unmarshal(groupRaw, &groups) != nil {
+					continue
+				}
+				for _, g := range groups {
+					for _, id := range g.ModelIDs {
+						add(id, "")
+					}
+				}
+			}
+		}
+	}
+	return ids, targets
+}
+
+// buildSupplements resolves metadata for ids the primary catalog omits.
+// Resolution order is freshness order:
+//
+//  1. the cross-realm catalog entry for the same id (live numbers observed
+//     minutes ago, e.g. CN's hy4-preview-f x0.00 for a Global account);
+//  2. the measured table (last verified live values, see measuredModels);
+//  3. the banner target's entry in the primary catalog (same model family,
+//     same limits and window) with the price left blank: a trial's billing is
+//     unknown until a catalog prices it, and a blank price keeps the id out
+//     of the free fallback pool rather than risking a billed fallback;
+//  4. a bare id, which takes the built-in defaults downstream.
+//
+// Ids already present in the primary catalog are skipped so they keep their
+// authoritative entry, as are service models and routing aliases.
+func buildSupplements(ids []string, targets map[string]string, primary, cross []upstreamModel) []upstreamModel {
+	if len(ids) == 0 {
+		return nil
+	}
+	have := make(map[string]struct{}, len(primary))
+	byPrimary := make(map[string]upstreamModel, len(primary))
+	for _, m := range primary {
+		id := strings.TrimSpace(m.ID)
+		if id == "" {
+			continue
+		}
+		have[id] = struct{}{}
+		byPrimary[id] = m
+	}
+	byCross := make(map[string]upstreamModel, len(cross))
+	for _, m := range cross {
+		if id := strings.TrimSpace(m.ID); id != "" {
+			byCross[id] = m
+		}
+	}
+	var out []upstreamModel
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, ok := have[id]; ok {
+			continue
+		}
+		if isServiceModel(id) || isRoutingAlias(upstreamModel{ID: id}) {
+			continue
+		}
+		switch live, ok := byCross[id]; {
+		case ok:
+			if live.Name == "" {
+				live.Name = id
+			}
+			live.ID = id
+			out = append(out, live)
+		default:
+			if measured, ok := measuredModels[id]; ok {
+				out = append(out, measured)
+				continue
+			}
+			if target := strings.TrimSpace(targets[id]); target != "" {
+				if live, ok := byPrimary[target]; ok {
+					live.ID = id
+					if live.Name == "" {
+						live.Name = id
+					}
+					live.Credits = ""
+					out = append(out, live)
+					continue
+				}
+			}
+			out = append(out, upstreamModel{ID: id, Name: id})
+		}
+	}
+	return out
+}
+
+// appendSupplements publishes the banner-derived ids. It runs after the publish
+// policy on purpose: supplements are always this realm's own trial entries
+// (hy4-preview-f style), never another provider's shared model, so they must
+// survive publish_mode=allow. Entries already published are skipped.
+func appendSupplements(models []pluginapi.ModelInfo, supplements []upstreamModel) []pluginapi.ModelInfo {
+	if len(supplements) == 0 {
+		return models
+	}
+	seen := make(map[string]struct{}, len(models))
+	for _, m := range models {
+		seen[m.ID] = struct{}{}
+	}
+	var pending []upstreamModel
+	for _, m := range supplements {
+		id := strings.TrimSpace(m.ID)
+		if id == "" || isServiceModel(id) || isRoutingAlias(m) {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		m.ID = id
+		if m.Name == "" {
+			m.Name = id
+		}
+		pending = append(pending, m)
+	}
+	if len(pending) == 0 {
+		return models
+	}
+	hostLog("info", "workbuddy: added catalog supplement models", map[string]any{"count": len(pending)})
+	return append(models, toModelInfos(pending)...)
+}
+
+// assembleModels combines the primary catalog, the supplements and the
+// configured extra_models into the published list, and returns the full
+// pre-publish catalog alongside it. The full catalog (primary plus supplements)
+// is what the fallback pool and the extra_models fill read: an id kept out of
+// the advertised list by publish_mode=allow is still one the account can
+// serve, and a bare extra_models id must resolve against the live numbers,
+// not against the filtered remainder.
+//
+// hostForcesPrefix is the host's live force-model-prefix flag, delivered with
+// every model.for_auth call. It decides whether bare ids are safe to publish:
+// with it on, everything below leaves here bare and the host exposes only the
+// <prefix>/<id> aliases, so a namespaced instance can publish its whole
+// catalog without leaking. With it off, every bare id below would ALSO be
+// published as-is, and a shared id (gpt-5.6-sol, kimi-k2.5, ...) would steal
+// traffic from its real provider. A namespaced instance therefore withholds
+// the whole primary catalog in that case — supplements and extra_models still
+// go out, exactly like publish_mode=allow — and logs how to get the full
+// list. An explicit publish_mode=allow is always respected as written,
+// whatever the host flag says. Instances without a model_prefix are
+// unaffected: bare publication is their operator's explicit choice.
+func assembleModels(sa *storedAuth, primary, supplements []upstreamModel, hostForcesPrefix bool) (models []pluginapi.ModelInfo, full []upstreamModel) {
+	full = mergeCatalogs(primary, supplements)
+	mode, _ := configuredPublish()
+	published := applyPublishPolicy(primary, sa)
+	if mode != "allow" && configuredModelPrefix() != "" && !hostForcesPrefix {
+		published = nil
+		hostLog("warn", "workbuddy: withholding the primary catalog: model_prefix is set but the host does not force model prefixes, so bare ids would leak to other providers", map[string]any{
+			"uid":    sa.Account.UID,
+			"region": normalizeRegion(sa.Region),
+			"fix":    "set force-model-prefix: true on the host for the full <prefix>/<id> list",
+		})
+	}
+	models = toModelInfos(published)
+	models = appendSupplements(models, supplements)
+	models = appendExtraModels(models, full)
+	return models, full
+}
 
 // -----------------------------------------------------------------------------
 // Tolerant decoding
@@ -539,6 +816,12 @@ func toModelInfos(models []upstreamModel) []pluginapi.ModelInfo {
 type modelCacheEntry struct {
 	models  []pluginapi.ModelInfo
 	expires time.Time
+	// hostForcesPrefix records the host's force-model-prefix flag at discovery
+	// time. The published list depends on it (a namespaced instance withholds
+	// its primary catalog when the host would publish bare ids), so a cached
+	// list built under the other flag value is a miss, never a hit. The
+	// remote catalog below is flag-independent and stays readable either way.
+	hostForcesPrefix bool
 	// remoteIDs is the id set of the catalog upstream actually served, before
 	// extra_models added anything. It is what tells a real model apart from an
 	// id we publish on our own: upstream answers unknown ids with a silent
@@ -561,20 +844,23 @@ func modelCacheKey(req pluginapi.AuthModelRequest, sa *storedAuth) string {
 	return normalizeRegion(sa.Region) + ":" + accountIdentity(sa)
 }
 
-func modelCacheLookup(key string) []pluginapi.ModelInfo {
+func modelCacheLookup(key string, hostForcesPrefix bool) []pluginapi.ModelInfo {
 	modelCache.mu.Lock()
 	defer modelCache.mu.Unlock()
 	entry, ok := modelCache.entries[key]
 	if !ok || time.Now().After(entry.expires) {
 		return nil
 	}
+	if entry.models != nil && entry.hostForcesPrefix != hostForcesPrefix {
+		return nil
+	}
 	return entry.models
 }
 
-func modelCacheStore(key string, models []pluginapi.ModelInfo) {
+func modelCacheStore(key string, models []pluginapi.ModelInfo, hostForcesPrefix bool) {
 	modelCache.mu.Lock()
 	defer modelCache.mu.Unlock()
-	modelCache.entries[key] = &modelCacheEntry{models: models, expires: time.Now().Add(modelCacheTTL)}
+	modelCache.entries[key] = &modelCacheEntry{models: models, expires: time.Now().Add(modelCacheTTL), hostForcesPrefix: hostForcesPrefix}
 }
 
 // modelCacheRememberRemote attaches the raw catalog to the cached entry — the
@@ -640,9 +926,12 @@ func modelsForAuth(req pluginapi.AuthModelRequest, sa *storedAuth) []pluginapi.M
 	key := modelCacheKey(req, sa)
 	noteIdentity(accountIdentity(sa))
 
-	models := modelCacheLookup(key)
+	// The host's live prefix flag: it decides whether the bare ids below stay
+	// internal (host exposes only <prefix>/<id>) or would leak as-is.
+	hostForcesPrefix := req.Host.ForceModelPrefix
+	models := modelCacheLookup(key, hostForcesPrefix)
 	if models == nil {
-		models = discoverModels(sa, key)
+		models = discoverModels(sa, key, hostForcesPrefix)
 	}
 	if len(models) == 0 {
 		return nil
@@ -655,9 +944,9 @@ func modelsForAuth(req pluginapi.AuthModelRequest, sa *storedAuth) []pluginapi.M
 
 // discoverModels fetches the catalog, applies the publish policy and the
 // configured extra_models, and caches the result.
-func discoverModels(sa *storedAuth, key string) []pluginapi.ModelInfo {
-	remote, err := fetchRemoteModels(sa)
-	if err != nil || len(remote) == 0 {
+func discoverModels(sa *storedAuth, key string, hostForcesPrefix bool) []pluginapi.ModelInfo {
+	primary, supplements, err := fetchRemoteModels(sa)
+	if err != nil || (len(primary) == 0 && len(supplements) == 0) {
 		reason := "empty model list"
 		if err != nil {
 			reason = err.Error()
@@ -678,18 +967,17 @@ func discoverModels(sa *storedAuth, key string) []pluginapi.ModelInfo {
 		})
 		return nil
 	}
-	// The publish policy decides what we advertise. It must not limit what a
-	// fallback may use: an id kept out of the advertised list is still one the
-	// account can serve, and it is exactly what keeps a request alive when the
-	// two or three published ids are the ones being throttled.
-	full := remote
-	remote = applyPublishPolicy(remote, sa)
-	models := appendExtraModels(toModelInfos(remote), remote)
-	modelCacheStore(key, models)
+	// assembleModels keeps the publish policy away from the fallback pool: an
+	// id kept out of the advertised list is still one the account can serve,
+	// and it is exactly what keeps a request alive when the two or three
+	// published ids are the ones being throttled.
+	models, full := assembleModels(sa, primary, supplements, hostForcesPrefix)
+	modelCacheStore(key, models, hostForcesPrefix)
 	modelCacheRememberRemote(key, full)
 	hostLog("info", "workbuddy: model discovery succeeded", map[string]any{
-		"uid":   sa.Account.UID,
-		"count": len(models),
+		"uid":         sa.Account.UID,
+		"count":       len(models),
+		"supplements": len(supplements),
 	})
 	return models
 }
@@ -768,18 +1056,19 @@ func applyPublishPolicy(remote []upstreamModel, sa *storedAuth) []upstreamModel 
 var publishLogOnce sync.Once
 
 // appendExtraModels adds the entries configured under plugins.configs.<id>.
-// extra_models. Upstream catalogs are not always complete: the Global realm
-// serves the hy4 family but leaves it out of /v3/config, and the endpoint that
-// does list it (console/models) answers 500 there with a Bearer token.
+// extra_models. Upstream catalogs are not always complete: Global /v3/config
+// still omits hy4-preview-x (and the console catalog that lists it answers
+// 500 there with a Bearer token), so that id stays a one-line manual entry.
 // Entries already present in the discovered catalog are skipped so they keep
 // their real metadata.
 //
 // Each entry is either a bare id or an object carrying catalog fields. Any
-// field the entry leaves out is filled from remote, the catalog this account
-// just fetched, so a configured model tracks the live upstream numbers instead
-// of the built-in defaults. A bare id that upstream has since started
-// advertising therefore picks up its real limits on the next refresh; the
-// defaults only apply to ids no source describes at all.
+// field the entry leaves out is filled from the full catalog (primary plus
+// supplements plus the live cross-realm view), so a configured model tracks
+// the live upstream numbers instead of the built-in defaults. A bare id that
+// upstream has since started advertising therefore picks up its real limits
+// on the next refresh; the measured table and then the defaults only apply
+// to ids no live source describes at all.
 func appendExtraModels(models []pluginapi.ModelInfo, remote []upstreamModel) []pluginapi.ModelInfo {
 	extra := configuredExtraModels()
 	if len(extra) == 0 {
@@ -873,14 +1162,20 @@ func fillFromCatalog(entry, live upstreamModel) upstreamModel {
 // measuredModels records limits read off the real catalog endpoints, so a
 // model no reachable endpoint describes still gets its true numbers instead
 // of the generic defaults. Every value here was observed on a live response;
-// the source is recorded next to it because these can drift.
+// the source is recorded next to it because these can drift. It is the last
+// resort in buildSupplements: the live cross-realm catalog wins whenever it
+// describes the id, so this table only fires while upstream omits it
+// everywhere the credential can reach.
 //
-// The hy4 family is why this exists:
-//   - Global /v3/config omits all three ids (verified: 35 models, only hy3),
-//     and the console catalog that does list them needs a browser cookie the
-//     plugin does not hold, so at runtime Global only sees /v3/config.
-//   - CN /v3/config does carry them, but which ids appear varies per account
-//     (one account showed -f, another -x), so no single account sees all.
+// History: Global /v3/config used to omit the whole hy4 family (only hy3),
+// and the console catalog that listed it needed a browser cookie the plugin
+// does not hold. Since 2026-09-24 Global /v3/config lists hy4-preview itself
+// (22 models), the trial banner supplies hy4-preview-f automatically, and the
+// cross-realm fetch supplies live metadata for both; hy4-preview-x is still
+// banner- and catalog-absent on Global, so it stays on extra_models plus this
+// table until upstream lists it. CN /v3/config carries the family but varies
+// per account (one account showed -f, another -x), so no single account sees
+// all three.
 //
 // hy4-preview also sells a selectable budget: the account can use 1M, but the
 // platform bills and enforces 200000 unless a session picks the larger window,
@@ -888,6 +1183,7 @@ func fillFromCatalog(entry, live upstreamModel) upstreamModel {
 var measuredModels = map[string]upstreamModel{
 	"hy4-preview": {
 		ID: "hy4-preview", Name: "Hy4 preview",
+		Credits:           "x0.29 credits",
 		MaxInputTokens:    1000000,
 		MaxOutputTokens:   64000,
 		SupportsImages:    true,
@@ -896,6 +1192,7 @@ var measuredModels = map[string]upstreamModel{
 	}, // source: Global console catalog, 200 via browser cookie, 2026-09-12
 	"hy4-preview-f": {
 		ID: "hy4-preview-f", Name: "Hy4 preview",
+		Credits:           "x0.00",
 		MaxInputTokens:    1000000,
 		MaxOutputTokens:   64000,
 		SupportsImages:    true,
@@ -904,6 +1201,7 @@ var measuredModels = map[string]upstreamModel{
 	"hy4-preview-x": {
 		ID:                "hy4-preview-x",
 		Name:              "Hy4 preview",
+		Credits:           "x0.29 credits",
 		MaxInputTokens:    1000000,
 		MaxOutputTokens:   64000,
 		SupportsImages:    true,

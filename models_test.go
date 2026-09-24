@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
@@ -690,4 +691,287 @@ func TestApplyPublishPolicyAllowOnlyFiltersNeverAdds(t *testing.T) {
 	if len(got) != 0 {
 		t.Fatalf("published %v, want nothing", got)
 	}
+}
+
+// TestExtractSupplementIDsFromBanner pins the real-time completion source: the
+// free-trial banner inside the same /v3/config response names the servable
+// hy4-preview-f even when data.models omits it (every Global account, and the
+// CN account that carries -x instead of -f).
+func TestExtractSupplementIDsFromBanner(t *testing.T) {
+	raw := json.RawMessage(`{
+		"models": [{"id":"hy4-preview"}],
+		"productFeaturesConfig": {"ModelTrialBanner": {"banners": [
+			{"modelId":"hy4-preview-f","targetModelId":"hy4-preview","trialDays":14}
+		]}},
+		"modelPromotions": [{"id":"p","modelIds":["deepseek-v4-flash-ioa"]}],
+		"modelTiers": [{"id":"tier","modelIds":["glm-5.3"]}]
+	}`)
+	ids, targets := extractSupplementIDs(raw)
+	byID := map[string]bool{}
+	for _, id := range ids {
+		byID[id] = true
+	}
+	for _, want := range []string{"hy4-preview-f", "deepseek-v4-flash-ioa", "glm-5.3"} {
+		if !byID[want] {
+			t.Errorf("supplement %q missing from %v", want, ids)
+		}
+	}
+	if targets["hy4-preview-f"] != "hy4-preview" {
+		t.Errorf("banner target = %q, want hy4-preview", targets["hy4-preview-f"])
+	}
+}
+
+// TestExtractSupplementIDsTolerance keeps a reshuffled envelope from breaking
+// discovery: a bare array, an empty object and a {"data": ...} envelope must
+// all decode without supplements rather than erroring.
+func TestExtractSupplementIDsTolerance(t *testing.T) {
+	banner := `"productFeaturesConfig": {"ModelTrialBanner": {"banners": [
+		{"modelId":"hy4-preview-f","targetModelId":"hy4-preview"}]}}`
+	for _, tc := range []struct {
+		name string
+		raw  string
+		want int
+	}{
+		{"bare array", `[{"id":"a"}]`, 0},
+		{"empty object", `{}`, 0},
+		{"null banner", `{"productFeaturesConfig":null}`, 0},
+		{"data envelope", `{"data": {` + banner + `}}`, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ids, _ := extractSupplementIDs(json.RawMessage(tc.raw))
+			if len(ids) != tc.want {
+				t.Fatalf("got %v, want %d ids", ids, tc.want)
+			}
+		})
+	}
+}
+
+// TestBuildSupplementsResolution pins the freshness order: the live
+// cross-realm entry wins, the measured table covers what no endpoint
+// describes, and the banner target's limits are the last resort before a bare
+// id — with the price left blank so an unpriced trial never enters the free
+// fallback pool.
+func TestBuildSupplementsResolution(t *testing.T) {
+	window := &contextWindow{DefaultLength: 200000, SupportedLengths: []int64{200000, 1000000}}
+	primary := []upstreamModel{{
+		ID: "hy4-preview", Name: "Hy4 preview",
+		Credits: "x0.29 credits", MaxInputTokens: 1000000, MaxOutputTokens: 64000,
+		SupportsImages: true, ContextWindow: window,
+	}}
+	cross := []upstreamModel{{
+		ID: "hy4-preview-f", Name: "Hy4 preview",
+		Credits: "x0.00", MaxInputTokens: 1000000, MaxOutputTokens: 64000,
+		SupportsImages: true,
+	}}
+	ids := []string{"hy4-preview-f", "hy4-preview", "completion-1.0", "default-model", "hy4-preview-new"}
+	targets := map[string]string{"hy4-preview-f": "hy4-preview", "hy4-preview-new": "hy4-preview"}
+	byID := map[string]upstreamModel{}
+	for _, m := range buildSupplements(ids, targets, primary, cross) {
+		byID[m.ID] = m
+	}
+	// Already catalogued, service and alias ids are never supplements.
+	for _, skip := range []string{"hy4-preview", "completion-1.0", "default-model"} {
+		if _, ok := byID[skip]; ok {
+			t.Errorf("%q must not become a supplement", skip)
+		}
+	}
+	// Cross-realm entry wins with its live free price.
+	f, ok := byID["hy4-preview-f"]
+	if !ok {
+		t.Fatal("hy4-preview-f missing")
+	}
+	if f.Credits != "x0.00" || f.MaxOutputTokens != 64000 || !f.SupportsImages {
+		t.Errorf("hy4-preview-f = %+v, want the live cross-realm entry", f)
+	}
+	// No live source: target's window, but a blank price.
+	nw, ok := byID["hy4-preview-new"]
+	if !ok {
+		t.Fatal("hy4-preview-new missing")
+	}
+	if nw.Credits != "" {
+		t.Errorf("hy4-preview-new Credits = %q, want blank (unknown trial billing)", nw.Credits)
+	}
+	if nw.ContextWindow == nil || nw.MaxInputTokens != 1000000 || !nw.SupportsImages {
+		t.Errorf("hy4-preview-new = %+v, want the target's limits", nw)
+	}
+}
+
+// TestBuildSupplementsMeasuredFallback pins the last resort before a bare id:
+// when the cross-realm catalog does not describe the banner id either, the
+// measured table still publishes the verified free-trial numbers instead of
+// the generic defaults — so hy4-preview-f stays in the free fallback pool.
+func TestBuildSupplementsMeasuredFallback(t *testing.T) {
+	primary := []upstreamModel{{ID: "hy4-preview", Name: "Hy4 preview"}}
+	got := buildSupplements(
+		[]string{"hy4-preview-f"},
+		map[string]string{"hy4-preview-f": "hy4-preview"},
+		primary, nil, // no cross-realm view: measured table must fire
+	)
+	if len(got) != 1 {
+		t.Fatalf("got %v, want one supplement", got)
+	}
+	f := got[0]
+	if !f.isFree() {
+		t.Errorf("hy4-preview-f Credits = %q, want the measured x0.00", f.Credits)
+	}
+	if f.MaxOutputTokens != 64000 || f.MaxInputTokens != 1000000 {
+		t.Errorf("hy4-preview-f = %+v, want the measured limits", f)
+	}
+}
+
+// TestAssembleModelsSupplementsSurviveAllow is the behaviour the Global
+// realm needs: under publish_mode=allow the primary catalog is filtered to
+// the allowlist, but the banner-derived trial id is still published, and the
+// extra_models fill reads the full pre-publish catalog.
+func TestAssembleModelsSupplementsSurviveAllow(t *testing.T) {
+	withPluginConfig(t, "publish_mode: allow\npublish_allow:\n  - hy3\n")
+	restore := configuredExtraModels()
+	t.Cleanup(func() { setConfiguredExtraModelsForTest(restore) })
+	setConfiguredExtraModelsForTest(extraIDs("hy4-preview-x"))
+
+	primary := []upstreamModel{
+		{ID: "hy3", Name: "Hy3", MaxInputTokens: 192000, MaxOutputTokens: 64000},
+		{ID: "gpt-5.6-luna", Name: "GPT", MaxInputTokens: 1000000, MaxOutputTokens: 128000},
+	}
+	supplements := []upstreamModel{{
+		ID: "hy4-preview-f", Name: "Hy4 preview", Credits: "x0.00",
+		MaxInputTokens: 1000000, MaxOutputTokens: 64000, SupportsImages: true,
+	}}
+	models, full := assembleModels(&storedAuth{}, primary, supplements, true)
+
+	got := map[string]pluginapi.ModelInfo{}
+	for _, m := range models {
+		got[m.ID] = m
+	}
+	if _, ok := got["hy3"]; !ok {
+		t.Error("allowlisted hy3 missing")
+	}
+	if _, ok := got["hy4-preview-f"]; !ok {
+		t.Error("banner supplement hy4-preview-f must survive publish_mode=allow")
+	}
+	if _, ok := got["gpt-5.6-luna"]; ok {
+		t.Error("gpt-5.6-luna must stay filtered under publish_mode=allow")
+	}
+	if _, ok := got["hy4-preview-x"]; !ok {
+		t.Error("extra_models hy4-preview-x missing")
+	}
+	// The fallback pool keeps everything the account can serve.
+	byFull := map[string]bool{}
+	for _, m := range full {
+		byFull[m.ID] = true
+	}
+	for _, want := range []string{"hy3", "gpt-5.6-luna", "hy4-preview-f"} {
+		if !byFull[want] {
+			t.Errorf("full catalog lost %q", want)
+		}
+	}
+	// The plugin always publishes bare ids: the host prepends model_prefix
+	// (global/...) itself. A literal "global/hy4-preview-f" here would come
+	// out as "global/global/hy4-preview-f" and lose its routing.
+	for _, m := range models {
+		if strings.Contains(m.ID, "/") {
+			t.Errorf("published id %q must stay bare, the host adds the prefix", m.ID)
+		}
+	}
+}
+
+// TestAssemblePrefixGuardWithholdsBareCatalog pins the isolation rule: a
+// namespaced instance (model_prefix set) must never publish bare ids. When
+// the host does not force prefixes, every bare id below would ALSO go out
+// as-is — so a shared id like gpt-5.6-sol would be claimed from its real
+// provider (openai). The primary catalog is therefore withheld entirely;
+// supplements and extra_models still go out, exactly like publish_mode=allow.
+// With the host flag on, the same input publishes everything, and the host
+// exposes only the global/* aliases.
+func TestAssemblePrefixGuardWithholdsBareCatalog(t *testing.T) {
+	withPluginConfig(t, "model_prefix: global\n")
+	restore := configuredExtraModels()
+	t.Cleanup(func() { setConfiguredExtraModelsForTest(restore) })
+	setConfiguredExtraModelsForTest(nil)
+
+	primary := []upstreamModel{
+		{ID: "hy3", Name: "Hy3", MaxInputTokens: 192000, MaxOutputTokens: 64000},
+		{ID: "gpt-5.6-sol", Name: "GPT", MaxInputTokens: 1000000, MaxOutputTokens: 128000},
+	}
+	supplements := []upstreamModel{{
+		ID: "hy4-preview-f", Name: "Hy4 preview", Credits: "x0.00",
+		MaxInputTokens: 1000000, MaxOutputTokens: 64000,
+	}}
+
+	idsOf := func(models []pluginapi.ModelInfo) map[string]bool {
+		got := map[string]bool{}
+		for _, m := range models {
+			got[m.ID] = true
+		}
+		return got
+	}
+
+	// Host does not force prefixes: bulk catalog withheld, supplement survives.
+	models, full := assembleModels(&storedAuth{}, primary, supplements, false)
+	got := idsOf(models)
+	if got["hy3"] || got["gpt-5.6-sol"] {
+		t.Errorf("primary catalog leaked without host force: %v", got)
+	}
+	if !got["hy4-preview-f"] {
+		t.Error("supplement hy4-preview-f must survive the guard")
+	}
+	if len(full) != 3 {
+		t.Errorf("full catalog = %d models, want 3 (guard trims publish, never capability)", len(full))
+	}
+
+	// Host forces prefixes: everything goes out bare internally, the host
+	// publishes only the global/* aliases — never the original names.
+	models, _ = assembleModels(&storedAuth{}, primary, supplements, true)
+	got = idsOf(models)
+	for _, want := range []string{"hy3", "gpt-5.6-sol", "hy4-preview-f"} {
+		if !got[want] {
+			t.Errorf("%q missing when the host forces prefixes", want)
+		}
+	}
+}
+
+// TestAssembleNoPrefixUnaffected keeps the CN behaviour: without a
+// model_prefix, bare publication is the operator's explicit choice and the
+// host flag changes nothing.
+func TestAssembleNoPrefixUnaffected(t *testing.T) {
+	withPluginConfig(t, "model_prefix: \"\"\n")
+	restore := configuredExtraModels()
+	t.Cleanup(func() { setConfiguredExtraModelsForTest(restore) })
+	setConfiguredExtraModelsForTest(nil)
+
+	primary := []upstreamModel{{ID: "hy3"}, {ID: "gpt-5.6-sol"}}
+	for _, forced := range []bool{false, true} {
+		models, _ := assembleModels(&storedAuth{}, primary, nil, forced)
+		if len(models) != 2 {
+			t.Errorf("forced=%v: published %d models, want 2", forced, len(models))
+		}
+	}
+}
+
+// TestModelCacheRespectsHostFlag pins the cache split: a list published while
+// the host forced prefixes must not be served after the flag flips off (it
+// would leak bare ids), and vice versa.
+func TestModelCacheRespectsHostFlag(t *testing.T) {
+	key := "global:cache-flag-test"
+	modelCache.mu.Lock()
+	delete(modelCache.entries, key)
+	modelCache.mu.Unlock()
+
+	forced := []pluginapi.ModelInfo{{ID: "hy3"}, {ID: "gpt-5.6-sol"}}
+	modelCacheStore(key, forced, true)
+	if got := modelCacheLookup(key, true); len(got) != 2 {
+		t.Fatalf("lookup under the same flag missed")
+	}
+	if got := modelCacheLookup(key, false); got != nil {
+		t.Fatalf("lookup under the flipped flag hit with %v, want a miss", got)
+	}
+	// A rediscovery under the new flag overwrites the entry.
+	guarded := []pluginapi.ModelInfo{{ID: "hy4-preview-f"}}
+	modelCacheStore(key, guarded, false)
+	if got := modelCacheLookup(key, false); len(got) != 1 {
+		t.Fatalf("lookup after re-store missed")
+	}
+	modelCache.mu.Lock()
+	delete(modelCache.entries, key)
+	modelCache.mu.Unlock()
 }
